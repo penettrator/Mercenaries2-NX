@@ -1,0 +1,126 @@
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 3bcd1ab2aa1..4029576fe0b 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -28,6 +28,8 @@ enum DebugFlags {
+     Annotate,
+     NoUgpr,
+     Cycles,
++    EmuSm50,
++    EmuSm50High,
+ }
+ 
+ pub struct Debug {
+@@ -54,6 +56,8 @@ impl Debug {
+                 "annotate" => flags |= 1 << DebugFlags::Annotate as u8,
+                 "nougpr" => flags |= 1 << DebugFlags::NoUgpr as u8,
+                 "cycles" => flags |= 1 << DebugFlags::Cycles as u8,
++                "emu_sm50" => flags |= 1 << DebugFlags::EmuSm50 as u8,
++                "emu_sm50_high" => flags |= 1 << DebugFlags::EmuSm50High as u8,
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -88,6 +92,14 @@ pub trait GetDebugFlags {
+         self.debug_flags() & (1 << DebugFlags::NoUgpr as u8) != 0
+     }
+ 
++    fn emu_sm50(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::EmuSm50 as u8) != 0
++    }
++
++    fn emu_sm50_high(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::EmuSm50High as u8) != 0
++    }
++
+     fn cycles(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::Cycles as u8) != 0
+     }
+diff --git a/src/nouveau/compiler/nak/sm50.rs b/src/nouveau/compiler/nak/sm50.rs
+index 29c068eebcf..357c04976b8 100644
+--- a/src/nouveau/compiler/nak/sm50.rs
++++ b/src/nouveau/compiler/nak/sm50.rs
+@@ -3377,6 +3377,84 @@ macro_rules! sm50_op_match {
+ 
+ impl SM50Op for Op {
+     fn legalize(&mut self, b: &mut LegalizeBuilder) {
++        // Diagnostic only: Eden rejects legacy SM50 multiply encodings.
++        // Form the exact 64-bit unsigned product with shifts/adds and carry;
++        // signed operands correct the high word modulo 2^32.
++        use crate::api::{GetDebugFlags, DEBUG};
++        if DEBUG.emu_sm50() {
++            // Constant Index PRMT: each nibble chooses one of eight bytes,
++            // optionally replicating that byte's sign bit into the output byte.
++            // Keep other modes/selectors unchanged until independently tested.
++            if let Op::Prmt(op) = self {
++                if let Some(selector) = op.get_sel() {
++                    use crate::builder::SSABuilder;
++                    b.copy_alu_src_if_not_reg(&mut op.srcs[0], RegFile::GPR, SrcType::ALU);
++                    b.copy_alu_src_if_not_reg(&mut op.srcs[1], RegFile::GPR, SrcType::ALU);
++                    let mut result: Option<Src> = None;
++                    for output_byte in 0..4_usize {
++                        let selected = selector.get(output_byte);
++                        let src = op.srcs[selected.src()].clone();
++                        let shift = (selected.byte() * 8) as u32;
++                        let byte = if selected.msb() {
++                            let sign = b.shl(src, (24-shift).into());
++                            b.shr(sign.into(), 31.into(), true)
++                        } else {
++                            b.shr(src, shift.into(), false)
++                        };
++                        let byte = b.lop2(LogicOp2::And, byte.into(), 255.into());
++                        let positioned: Src = b.shl(byte.into(), ((output_byte*8) as u32).into()).into();
++                        result = Some(match result {
++                            Some(previous) => b.lop2(LogicOp2::Or, previous, positioned).into(),
++                            None => positioned,
++                        });
++                    }
++                    *self = OpIAdd2 { dst: op.dst.clone(), srcs: [result.unwrap(), 0.into()], carry_out: Dst::None }.into();
++                }
++            }
++            if let Op::IMul(op) = self {
++              if !op.high || DEBUG.emu_sm50_high() {
++                use crate::builder::SSABuilder;
++                b.copy_alu_src_if_not_reg(&mut op.srcs[0], RegFile::GPR, SrcType::ALU);
++                b.copy_alu_src_if_not_reg(&mut op.srcs[1], RegFile::GPR, SrcType::ALU);
++                let a = op.srcs[0].clone();
++                let factor = op.srcs[1].clone();
++                let mut low: Src = 0.into();
++                let mut high: Src = 0.into();
++                let one: Src = if op.high { b.iadd(0.into(), 1.into(), 0.into()).into() } else { 0.into() };
++                for shift in 0..32_u32 {
++                    let bit = b.shr(factor.clone(), shift.into(), false);
++                    let bit = b.lop2(LogicOp2::And, bit.into(), 1.into());
++                    let mask = b.ineg(bit.into());
++                    let shifted = b.shl(a.clone(), shift.into());
++                    let term = b.lop2(LogicOp2::And, shifted.into(), mask.into());
++                    let next = b.iadd(low.clone(), term.into(), 0.into());
++                    if op.high {
++                        let overflow = b.isetp(IntCmpType::U32, IntCmpOp::Lt, next.into(), low);
++                        let carry = b.sel(overflow.into(), one.clone(), 0.into());
++                        let upper = if shift == 0 { 0.into() } else {
++                            b.shr(a.clone(), (32-shift).into(), false).into()
++                        };
++                        let upper = b.lop2(LogicOp2::And, upper, mask.into());
++                        high = b.iadd(high, upper.into(), 0.into()).into();
++                        high = b.iadd(high, carry.into(), 0.into()).into();
++                    }
++                    low = next.into();
++                }
++                if op.high {
++                    for operand in 0..2 {
++                        if op.signed[operand] {
++                            let sign = b.shr(op.srcs[operand].clone(), 31.into(), true);
++                            let correction = b.lop2(LogicOp2::And, sign.into(), op.srcs[1-operand].clone());
++                            let correction = b.ineg(correction.into());
++                            high = b.iadd(high, correction.into(), 0.into()).into();
++                        }
++                    }
++                }
++                let product = if op.high {high} else {low};
++                *self = OpIAdd2 { dst: op.dst.clone(), srcs: [product, 0.into()], carry_out: Dst::None }.into();
++              }
++            }
++        }
+         sm50_op_match!(self, |op| op.legalize(b));
+     }
+     fn encode(&self, e: &mut SM50Encoder<'_>) {

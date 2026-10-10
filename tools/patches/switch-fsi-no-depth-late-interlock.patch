@@ -1,0 +1,93 @@
+--- a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -33,7 +33,10 @@
+     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
+     // prototyping stage (easier to do small granular updates with an
+     // incremental counter).
+-    static constexpr uint32_t kVersion = 12;
++    static constexpr uint32_t kVersion = 0x20261008;
++    // Spare pixel modification bit; preserve all existing fields and 64-bit ABI.
++    // Set only for no depth/stencil, no kills/memexport/depth output/alpha coverage.
++    static constexpr uint64_t kFSINoDepthLateInterlock = uint64_t(1) << 49;
+ 
+     enum class DepthStencilMode : uint32_t {
+       kNoModifiers,
+@@ -709,7 +712,8 @@
+   // 2x2 quads.
+   bool FSI_IsDepthStencilEarly() const {
+     assert_true(edram_fragment_shader_interlock_);
+-    return !is_depth_only_fragment_shader_ && !current_shader().writes_depth() &&
++    return !(GetSpirvShaderModification().value & Modification::kFSINoDepthLateInterlock) &&
++           !is_depth_only_fragment_shader_ && !current_shader().writes_depth() &&
+            !current_shader().memexport_eM_written();
+   }
+   void FSI_LoadSampleMask(spv::Id msaa_samples);
+--- a/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -800,6 +800,11 @@
+   spv::Block* block_fsi_if_after_depth_stencil_merge = nullptr;
+ 
+   if (edram_fragment_shader_interlock_) {
++    if (GetSpirvShaderModification().value & Modification::kFSINoDepthLateInterlock) {
++      // Once on every path, including helper/zero-coverage invocations. Guest
++      // texture work is complete; ordered EDRAM blending/stores remain protected.
++      builder_->createNoResultOp(spv::OpBeginInvocationInterlockEXT);
++    }
+     if (fsi_pixel_potentially_killed) {
+       if (features_.demote_to_helper_invocation) {
+         // Don't do anything related to writing to the EDRAM if the pixel was
+@@ -866,7 +871,9 @@
+       // Begin the critical section on the outermost control flow level so it's
+       // entered exactly once on any control flow path as required by the SPIR-V
+       // extension specification.
+-      builder_->createNoResultOp(spv::OpBeginInvocationInterlockEXT);
++      if (!(GetSpirvShaderModification().value & Modification::kFSINoDepthLateInterlock)) {
++        builder_->createNoResultOp(spv::OpBeginInvocationInterlockEXT);
++      }
+       // Do the depth / stencil test.
+       // The sample mask might have been made narrower than the initially loaded
+       // mask by various conditions that discard the whole pixel, as well as by
+@@ -1679,6 +1686,9 @@
+ 
+ void SpirvShaderTranslator::FSI_DepthStencilTest(spv::Id msaa_samples,
+                                                  bool sample_mask_potentially_narrowed_previouly) {
++  // The pipeline key proves both tests disabled. Preserve the input/narrowed
++  // sample mask, exactly as the original runtime-disabled branch did.
++  if (GetSpirvShaderModification().value & Modification::kFSINoDepthLateInterlock) return;
+   bool is_early = FSI_IsDepthStencilEarly();
+   bool shader_writes_depth = current_shader().writes_depth();
+   bool implicit_early_z_write_allowed = current_shader().implicit_early_z_write_allowed();
+--- a/sdk/src/graphics/vulkan/pipeline_cache.cpp
++++ b/sdk/src/graphics/vulkan/pipeline_cache.cpp
+@@ -1027,6 +1027,18 @@
+     }
+   }
+ 
++#if REX_PLATFORM_SWITCH
++  // Specialize only read-only guest bodies whose coverage does not depend on
++  // depth, stencil, shader kills or alpha. Dynamic state is part of the shader
++  // key so enabling any of those conditions selects the original shader.
++  if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock &&
++      !normalized_depth_control.z_enable && !normalized_depth_control.stencil_enable &&
++      !shader.kills_pixels() && !shader.writes_depth() && !shader.memexport_eM_written() &&
++      (!shader.writes_color_target(0) ||
++       !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()))) {
++    modification.value |= SpirvShaderTranslator::Modification::kFSINoDepthLateInterlock;
++  }
++#endif
+   return modification;
+ }
+ 
+@@ -1051,6 +1063,12 @@
+   }
+   if (pixel_shader != nullptr) {
+     if (!pixel_shader->is_translated()) {
++#if REX_PLATFORM_SWITCH
++      if (pixel_shader->modification() & SpirvShaderTranslator::Modification::kFSINoDepthLateInterlock) {
++        REXGPU_INFO("FSI_NO_DEPTH_LATE ps={:016X} modification={:016X}",
++                    pixel_shader->shader().ucode_data_hash(), pixel_shader->modification());
++      }
++#endif
+       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+       if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
+         REXGPU_ERROR("Failed to translate the pixel shader!");

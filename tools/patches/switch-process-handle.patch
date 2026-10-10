@@ -1,0 +1,73 @@
+diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_switch.cpp
+index eb24fd7..dd514c2 100644
+--- a/sdk/src/core/guest_memory_switch.cpp
++++ b/sdk/src/core/guest_memory_switch.cpp
+@@ -120,7 +120,67 @@ State& S() {
+     return s;
+ }
+ 
+-Handle Proc() { return envGetOwnProcessHandle(); }
++// nx-hbloader normally supplies this handle through the homebrew ABI. Direct
++// NRO loaders may omit it. Obtain a real handle by copying the current-process
++// pseudo handle through a local IPC session, as nx-hbloader itself does:
++// https://github.com/switchbrew/nx-hbloader/blob/master/source/main.c
++// A pseudo handle alone cannot be used by svcMapProcessMemory.
++struct ProcessHandleRequest {
++    Handle server = INVALID_HANDLE;
++    Handle received = INVALID_HANDLE;
++};
++
++void ReceiveProcessHandle(void* argument) {
++    auto& request = *static_cast<ProcessHandleRequest*>(argument);
++    void* tls = armGetTls();
++    hipcMakeRequest(tls, HipcMetadata{});
++    s32 index = 0;
++    const Result rc = svcReplyAndReceive(&index, &request.server, 1,
++                                        INVALID_HANDLE, 5000000000ULL);
++    if (R_SUCCEEDED(rc)) {
++        const HipcParsedRequest message = hipcParseRequest(tls);
++        if (message.meta.num_copy_handles == 1) {
++            request.received = message.data.copy_handles[0];
++        }
++    }
++    // Closing the receiving endpoint also wakes the synchronous sender.
++    svcCloseHandle(request.server);
++}
++
++Handle Proc() {
++    const Handle supplied = envGetOwnProcessHandle();
++    if (supplied != INVALID_HANDLE) return supplied;
++    static const Handle fallback = [] {
++        ProcessHandleRequest request;
++        Handle client = INVALID_HANDLE;
++        Result rc = svcCreateSession(&request.server, &client, 0, 0);
++        if (R_FAILED(rc)) return Handle{INVALID_HANDLE};
++        Thread receiver{};
++        rc = threadCreate(&receiver, ReceiveProcessHandle, &request, nullptr,
++                          0x4000, 0x20, 0);
++        if (R_FAILED(rc)) {
++            svcCloseHandle(request.server);
++            svcCloseHandle(client);
++            return Handle{INVALID_HANDLE};
++        }
++        rc = threadStart(&receiver);
++        if (R_FAILED(rc)) {
++            threadClose(&receiver);
++            svcCloseHandle(request.server);
++            svcCloseHandle(client);
++            return Handle{INVALID_HANDLE};
++        }
++        HipcMetadata metadata{};
++        metadata.num_copy_handles = 1;
++        hipcMakeRequest(armGetTls(), metadata).copy_handles[0] = CUR_PROCESS_HANDLE;
++        svcSendSyncRequest(client);
++        svcCloseHandle(client);
++        threadWaitForExit(&receiver);
++        threadClose(&receiver);
++        return request.received;
++    }();
++    return fallback;
++}
+ 
+ bool Intersect(size_t a, size_t al, size_t b, size_t bl, size_t* lo, size_t* hi) {
+     const size_t l = a > b ? a : b;

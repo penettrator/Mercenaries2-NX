@@ -1,0 +1,16 @@
+diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/graphics/pipeline/shader/spirv_translator.cpp
+index 38fc7d1..af4e406 100644
+--- a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/sdk/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -499,10 +499,10 @@ void SpirvShaderTranslator::StartTranslation() {
+     var_main_vfetch_address_ =
+         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
+                                  "xe_var_vfetch_address", const_int_0_);
+-    var_main_tfetch_lod_ =
+     var_main_vfetch_bound_ =
+         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
+                                  "xe_var_vfetch_bound", const_int_0_);
++    var_main_tfetch_lod_ =
+         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
+                                  "xe_var_tfetch_lod", const_float_0_);
+     var_main_tfetch_gradients_h_ =

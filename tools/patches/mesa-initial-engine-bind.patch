@@ -1,0 +1,45 @@
+diff --git a/src/nouveau/horizon/nouveau_horizon_channel.c b/src/nouveau/horizon/nouveau_horizon_channel.c
+index e0fa51f6bcd..297b48d0d81 100644
+--- a/src/nouveau/horizon/nouveau_horizon_channel.c
++++ b/src/nouveau/horizon/nouveau_horizon_channel.c
+@@ -1543,8 +1543,20 @@ nouveau_horizon_channel_create(
+       NOUVEAU_HORIZON_WAIT_SLICE_COUNT *
+          NOUVEAU_HORIZON_WAIT_SLICE_WORDS;
+    channel->cache_acquire_offset_words = commands - channel->builtin_cpu;
+-   channel->cache_acquire_words =
+-      nouveau_horizon_gm20b_build_cache_acquire(commands);
++   /* The acquire prefix runs before NVK's queue state initialization.
++    * Its 3D cache methods therefore need an explicitly bound subchannel.
++    * Bind GM20B Maxwell B on subchannel zero before the first 0x4A2.
++    */
++   commands[0] = (1u << 29) | (1u << 16); /* SET_OBJECT, count 1 */
++   commands[1] = 0xB197;                 /* MAXWELL_B */
++   /* NVK's transfer path assumes the winsys binds the copy engine.
++    * Unlike 3D/compute queue state, it does not emit SET_OBJECT itself.
++    * SUBC_NV90B5 is four and GM20B uses MAXWELL_DMA_COPY_A.
++    */
++   commands[2] = (1u << 29) | (1u << 16) | (4u << 13);
++   commands[3] = 0xB0B5;
++   channel->cache_acquire_words = 4 +
++      nouveau_horizon_gm20b_build_cache_acquire(commands + 4);
+    commands += channel->cache_acquire_words;
+ 
+    channel->cache_acquire_sync_offset_words = commands -
+@@ -1852,9 +1864,16 @@ nouveau_horizon_channel_exec_locked(
+    const struct nouveau_horizon_exec *execs)
+ {
+    const uint32_t acquire_entries = channel->cache_acquire_emitted ? 0 : 2;
++   /* Keep room for the submission tail: submit_locked reserves its fence
++    * and report entries (up to 2) plus a prepended cross-channel wait (1)
++    * on top of the final skid.  Reserving only the skid here let a batch
++    * fill the GPFIFO to exactly the skid, and the following submit then
++    * failed with NO_SPACE ("channel submit failed: no queue space"), which
++    * nvk turns into a lost device.
++    */
+    enum nouveau_horizon_status status =
+       nouveau_horizon_channel_reserve_entries_locked(
+-         channel, exec_count + acquire_entries, 0);
++         channel, exec_count + acquire_entries, 3);
+    if (status != NOUVEAU_HORIZON_SUCCESS)
+       goto done;
+ 

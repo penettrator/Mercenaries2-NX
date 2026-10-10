@@ -1,0 +1,103 @@
+diff --git a/src/nouveau/horizon/nouveau_horizon_channel.c b/src/nouveau/horizon/nouveau_horizon_channel.c
+index e0fa51f6bcd..e925ec6b377 100644
+--- a/src/nouveau/horizon/nouveau_horizon_channel.c
++++ b/src/nouveau/horizon/nouveau_horizon_channel.c
+@@ -13,6 +13,7 @@
+ 
+ #include <assert.h>
+ #include <limits.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ #define NOUVEAU_HORIZON_FENCE_POLL_NS UINT64_C(50000000)
+@@ -818,6 +819,40 @@ nouveau_horizon_channel_reserve_entries_locked(
+    return NOUVEAU_HORIZON_SUCCESS;
+ }
+ 
++/* Opt-in startup diagnostics: preserve submitted words without changing fences. */
++static void
++mercenaries2_trace_channel_entry(struct nouveau_horizon_channel *channel,
++                                uint64_t addr, uint32_t words, uint32_t flags)
++{
++   static int enabled = -1;
++   static unsigned serial = 0;
++   if (enabled < 0) {
++      FILE *flag = fopen("sdmc:/switch/Mercenaries2/emulator_memory_test.flag", "rb");
++      enabled = flag != NULL;
++      if (flag) fclose(flag);
++   }
++   if (!enabled || serial >= 256) return;
++   const unsigned index = serial++;
++   FILE *log = fopen("sdmc:/switch/Mercenaries2/nvk-submit.log", "a");
++   if (log) {
++      fprintf(log, "entry=%u channel=%llu queued=%u addr=%llX words=%u flags=%X sync=%u\n",
++              index, (unsigned long long)channel->id, channel->gpu_channel.num_entries,
++              (unsigned long long)addr, words, flags, channel->syncpoint_id);
++      fclose(log);
++   }
++   const uint64_t size = nouveau_horizon_memory_get_size(channel->builtin_memory);
++   if (addr < channel->builtin_addr || addr - channel->builtin_addr > size ||
++       (uint64_t)words * 4 > size - (addr - channel->builtin_addr)) return;
++   char path[160];
++   snprintf(path, sizeof(path), "sdmc:/switch/Mercenaries2/nvk-entry-%03u-%llX.bin",
++            index, (unsigned long long)addr);
++   FILE *dump = fopen(path, "wb");
++   if (dump) {
++      fwrite((const char *)channel->builtin_cpu + (addr - channel->builtin_addr), 4, words, dump);
++      fclose(dump);
++   }
++}
++
+ static enum nouveau_horizon_status
+ nouveau_horizon_channel_append_locked(
+    struct nouveau_horizon_channel *channel,
+@@ -847,6 +882,8 @@ nouveau_horizon_channel_append_locked(
+    if (status != NOUVEAU_HORIZON_SUCCESS)
+       return status;
+ 
++   mercenaries2_trace_channel_entry(channel, addr, command_count, flags);
++
+    const Result rc = nvGpuChannelAppendEntry(&channel->gpu_channel,
+                                               addr, command_count,
+                                               flags, 0);
+@@ -1543,8 +1580,20 @@ nouveau_horizon_channel_create(
+       NOUVEAU_HORIZON_WAIT_SLICE_COUNT *
+          NOUVEAU_HORIZON_WAIT_SLICE_WORDS;
+    channel->cache_acquire_offset_words = commands - channel->builtin_cpu;
+-   channel->cache_acquire_words =
+-      nouveau_horizon_gm20b_build_cache_acquire(commands);
++   /* The acquire prefix runs before NVK's queue state initialization.
++    * Its 3D cache methods therefore need an explicitly bound subchannel.
++    * Bind GM20B Maxwell B on subchannel zero before the first 0x4A2.
++    */
++   commands[0] = (1u << 29) | (1u << 16); /* SET_OBJECT, count 1 */
++   commands[1] = 0xB197;                 /* MAXWELL_B */
++   /* NVK's transfer path assumes the winsys binds the copy engine.
++    * Unlike 3D/compute queue state, it does not emit SET_OBJECT itself.
++    * SUBC_NV90B5 is four and GM20B uses MAXWELL_DMA_COPY_A.
++    */
++   commands[2] = (1u << 29) | (1u << 16) | (4u << 13);
++   commands[3] = 0xB0B5;
++   channel->cache_acquire_words = 4 +
++      nouveau_horizon_gm20b_build_cache_acquire(commands + 4);
+    commands += channel->cache_acquire_words;
+ 
+    channel->cache_acquire_sync_offset_words = commands -
+@@ -1852,9 +1901,16 @@ nouveau_horizon_channel_exec_locked(
+    const struct nouveau_horizon_exec *execs)
+ {
+    const uint32_t acquire_entries = channel->cache_acquire_emitted ? 0 : 2;
++   /* Keep room for the submission tail: submit_locked reserves its fence
++    * and report entries (up to 2) plus a prepended cross-channel wait (1)
++    * on top of the final skid.  Reserving only the skid here let a batch
++    * fill the GPFIFO to exactly the skid, and the following submit then
++    * failed with NO_SPACE ("channel submit failed: no queue space"), which
++    * nvk turns into a lost device.
++    */
+    enum nouveau_horizon_status status =
+       nouveau_horizon_channel_reserve_entries_locked(
+-         channel, exec_count + acquire_entries, 0);
++         channel, exec_count + acquire_entries, 3);
+    if (status != NOUVEAU_HORIZON_SUCCESS)
+       goto done;
+ 

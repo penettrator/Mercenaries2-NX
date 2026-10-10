@@ -1,0 +1,22 @@
+--- a/sdk/src/kernel/xam/xam_info.cpp	2026-10-10 14:50:52.083444900 +0300
++++ b/sdk/src/kernel/xam/xam_info.cpp	2026-10-10 14:50:52.120006900 +0300
+@@ -20,6 +20,7 @@
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
++#include <rex/system/flags.h>
+ 
+ #if REX_PLATFORM_WIN32
+ #include <windows.h>
+@@ -183,6 +184,11 @@
+ }
+ 
+ u32 XGetLanguage_entry() {
++  // Mercenaries 2 (HANDOFF B:130): the console language is the user_language cvar (as
++  // ExGetXConfigSetting already reports it), not always English.
++  if (REXCVAR_GET(user_language) != 0 && REXCVAR_GET(user_language) != 1) {
++    return REXCVAR_GET(user_language);
++  }
+   auto desired_language = XLanguage::kEnglish;
+ 
+   // Switch the language based on game region.

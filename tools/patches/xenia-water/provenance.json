@@ -1,0 +1,67 @@
+{
+  "source": "https://github.com/xenia-canary/xenia-canary/pull/898",
+  "purpose": "Correct signed fixed-point EDRAM range for Mercenaries 2 water; D3D12 shader bytecode only",
+  "license": "BSD-3-Clause, Xenia",
+  "files": [
+    {
+      "file": "resolve_full_128bpp_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_128bpp_cs.h",
+      "sha256": "ff619863005b139c35d787177b338530504b02dbbedf413b9cbac9dd74cc3b05",
+      "original_sha256": "58862a22328f133064d872311b14662d8d68b77c371c5b0bc8ee9634d58fa3ec"
+    },
+    {
+      "file": "resolve_full_128bpp_scaled_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_128bpp_scaled_cs.h",
+      "sha256": "913b01d4c81495ab36eb2ac64e168151f5b42662d33b82347c3629ea1704edeb",
+      "original_sha256": "b95f7ebb8e12aae025c35c5398c3a9093cbb722b8c96848ea6325ad6aa1fdb73"
+    },
+    {
+      "file": "resolve_full_16bpp_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_16bpp_cs.h",
+      "sha256": "a0f92f9414069e609dc2d12d5c981cd5d5efabd8ef1109a82fa393aaf0a69c1f",
+      "original_sha256": "f931b6449df8cf36cfa90586c0f763e36e8f5585e5dafbe90bf3e60271ecc228"
+    },
+    {
+      "file": "resolve_full_16bpp_scaled_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_16bpp_scaled_cs.h",
+      "sha256": "897c31e7bb624d325b045107bb8dba69bb5ddb9e14cbf4e4113ad27b6fbb6e0b",
+      "original_sha256": "9f7a55fca69045ffb05aeec1e8c0938a83a857ffa64d9b76c1ce0110f6450b8d"
+    },
+    {
+      "file": "resolve_full_32bpp_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_32bpp_cs.h",
+      "sha256": "4883fee802d28a20cbae689efe5f3646a1f5409a80bf666f353665ed25f5791d",
+      "original_sha256": "367a650db7e042026a88c345b8c15a4301edccbd4655fba5c288f286f7e658ce"
+    },
+    {
+      "file": "resolve_full_32bpp_scaled_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_32bpp_scaled_cs.h",
+      "sha256": "cdb07da9493db59f306b3a307509061e1add9940548e0279aca3ec444ff8afa6",
+      "original_sha256": "89a96c59b063b99be06bfd114b667ed3ef3378b21876d76a5753ad7306c29655"
+    },
+    {
+      "file": "resolve_full_64bpp_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_64bpp_cs.h",
+      "sha256": "0e40c2bbbae31c7e974e9107849a4c016a371b2f9438c2585964de7f02d596e5",
+      "original_sha256": "8b3ecfb23ba959e30117bd5bab2f43b604d2b7184117a7c96737ca8df41b72ab"
+    },
+    {
+      "file": "resolve_full_64bpp_scaled_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_64bpp_scaled_cs.h",
+      "sha256": "b522700a068badf731ef705361abc413c99a8c47cedeccf57f7ad32e0f3dde3d",
+      "original_sha256": "3fbf0d54ba181fc0c2a9565ac84946a40470ee13ce8f4189f42450c498cfcfde"
+    },
+    {
+      "file": "resolve_full_8bpp_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_8bpp_cs.h",
+      "sha256": "236d169a4df370d2f12525fb1a13a81f4277bd27dcfe0ba760e67fcefcdcd2bb",
+      "original_sha256": "8c31f516787fcc6aa0db20a491de5618395dab2fac57e7d7ccb293f26908f21c"
+    },
+    {
+      "file": "resolve_full_8bpp_scaled_cs.h",
+      "url": "https://github.com/xenia-canary/xenia-canary/raw/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src%2Fxenia%2Fgpu%2Fshaders%2Fbytecode%2Fd3d12_5_1%2Fresolve_full_8bpp_scaled_cs.h",
+      "sha256": "ec2a6b7c993540af1506b5281724b8f6e30fe9a2aaa79e9b0430f7f1f0ee1c8b",
+      "original_sha256": "0af56cb0fff4431fb90089bb217625c1f0f79d15df11a8a869b4b634c95bb727"
+    }
+  ]
+}

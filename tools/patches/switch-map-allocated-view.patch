@@ -1,0 +1,64 @@
+--- a/sdk/src/core/guest_memory_switch.h
++++ b/sdk/src/core/guest_memory_switch.h
+@@ -127,6 +127,9 @@
+  */
+ bool RexGmFaultIn(uint64_t window_address);
+ 
++/* Map committed writable memory into only the requested view, idempotently. */
++bool RexGmMapCommittedRange(uint8_t* address, size_t length);
++
+ /**
+  * Changes the logical permissions of a range of the window.
+  *
+--- a/sdk/src/core/guest_memory_switch.cpp
++++ b/sdk/src/core/guest_memory_switch.cpp
+@@ -651,6 +651,32 @@
+     if (!c) return false;                                       /* not committed */
+     if (s.view_mapped.count({vi, c->offset}) != 0) return false; /* already there */
+     return MapChunkIntoView(s, vi, *c);
++}
++
++bool RexGmMapCommittedRange(uint8_t* address, size_t length) {
++    State& s = S();
++    std::lock_guard<std::mutex> lock(s.mutex);
++    const uint64_t start = reinterpret_cast<uint64_t>(address);
++    const uint64_t base = reinterpret_cast<uint64_t>(s.base);
++    if (!s.base || start < base || start - base >= s.size ||
++        length > s.size - (start - base)) return false;
++    const uint64_t end = start + length;
++    for (uint64_t current = start; current < end;) {
++        size_t vi = 0;
++        if (!ViewIndexFor(s, current, &vi)) return false;
++        const View& view = s.views[vi];
++        const uint64_t view_base = reinterpret_cast<uint64_t>(view.base);
++        const size_t offset = view.offset + (current - view_base);
++        Chunk* chunk = ChunkAt(s, offset);
++        if (!chunk || AccessOf(s, AlignDown(current - base, kPageSize)) != REX_GM_WRITE)
++            return false;
++        if (!s.view_mapped.count({vi, chunk->offset}) &&
++            !MapChunkIntoView(s, vi, *chunk)) return false;
++        current += std::min<uint64_t>(end - current,
++            std::min<uint64_t>(chunk->offset + chunk->length - offset,
++                              view_base + view.length - current));
++    }
++    return true;
+ }
+ 
+ bool RexGmDecommit(size_t offset, size_t length) {
+--- a/sdk/src/core/memory_switch.cpp
++++ b/sdk/src/core/memory_switch.cpp
+@@ -176,6 +176,14 @@
+                  reinterpret_cast<uintptr_t>(base_address), RexGmLastResult());
+     return nullptr;
+   }
++  // A successful writable commit must be usable by its caller immediately.
++  // Map only this allocation's view; other physical mirrors remain lazy.
++  if (ToGm(access) == REX_GM_WRITE &&
++      !RexGmMapCommittedRange(static_cast<uint8_t*>(base_address), length)) {
++    REXLOG_ERROR("AllocFixed: unable to map committed allocation (failure 0x{:08X})",
++                 RexGmLastResult());
++    return nullptr;
++  }
+   return base_address;
+ }
+ 

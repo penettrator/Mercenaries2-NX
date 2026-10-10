@@ -1,0 +1,6 @@
+[functions]
+# ReXGlue 0.10.0 baseline validation: direct b at 0x8288F0D4 targets
+# 0x828892C0, which automatic discovery did not assign to a function.
+# Declare only this entry; Discover must infer its extent from the PPC code.
+# This corrects static discovery and is not yet a runtime-validated hook.
+"0x828892C0" = { }

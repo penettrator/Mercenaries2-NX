@@ -1,0 +1,64 @@
+# Baseline discovery only. No Mass Effect hooks or overrides apply to this title.
+[project]
+name = "mercenaries2"
+sdk_version = "0.10.0"
+game_root = "../assets/game_root"
+
+[entrypoint]
+file_path = "../assets/game_root/default.xex"
+out_directory_path = "generated/probe"
+
+# Inline because upstream 0.10.0 cannot open included TOMLs under a Cyrillic
+# Windows path. Details and evidence in analysis_overrides.toml.
+[entrypoint.functions]
+"0x828892C0" = { }
+# sub_8223D180 branches to a non-contiguous leaf tail at 0x8223D340.
+# Baseline output emits its instructions and labels through blr at 0x8223D450,
+# but conditional branches inside that tail remain unresolved. Register its
+# ownership explicitly instead of widening the parent over intervening functions.
+"0x8223D340" = { parent = 0x8223D180, size = 0x114 }
+
+"0x82163E10" = { }
+
+
+"0x828ACBC8" = { }
+
+"0x823D9128" = { }
+
+"0x82382CE8" = { }
+
+"0x82389690" = { }
+
+"0x82897088" = { }
+
+"0x82731E88" = { }
+
+"0x8271C668" = { }
+
+"0x8278EE80" = { }
+
+"0x82834C10" = { }
+
+"0x826FC5E0" = { }
+
+"0x82720550" = { }
+
+"0x82731F58" = { }
+
+"0x8222EE70" = { }
+
+"0x8238FDA8" = { }
+
+"0x823D9140" = { }
+
+"0x8271C618" = { }
+
+"0x8271C640" = { }
+
+"0x82720560" = { }
+
+"0x82731F40" = { }
+
+"0x8277F398" = { }
+
+"0x828ACC10" = { }

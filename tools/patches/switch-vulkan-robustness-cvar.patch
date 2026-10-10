@@ -1,0 +1,45 @@
+diff --git a/sdk/src/ui/vulkan/vulkan_device.cpp b/sdk/src/ui/vulkan/vulkan_device.cpp
+index 02187e1..0456b6c 100644
+--- a/sdk/src/ui/vulkan/vulkan_device.cpp
++++ b/sdk/src/ui/vulkan/vulkan_device.cpp
+@@ -46,6 +46,15 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/V
+                     "allow fallback to solid fill for line/point polygon modes)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++// Mercenaries 2 (HANDOFF section 67): robustBufferAccess makes NVK bounds-check every storage
++// buffer access of every shader (vertex fetch from shared memory included), and so does robustness2
++// nullDescriptor (vk_device.c null_*_buffer_descriptor). The Xenos shaders
++// mask their shared memory addresses themselves; nothing in the SDK reads the property.
++REXCVAR_DEFINE_BOOL(vulkan_robust_buffer_access, true, "UI/Vulkan",
++                    "Enable robustBufferAccess and robustness2 nullDescriptor for GPU emulation (both make "
++                    "NVK bounds-check buffer accesses in every shader)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
+@@ -656,6 +665,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ 
+   if (with_gpu_emulation) {
+     XE_UI_VULKAN_FEATURE(robustBufferAccess)
++    if (!REXCVAR_GET(vulkan_robust_buffer_access)) {
++      enabled_features.robustBufferAccess = VK_FALSE;
++      device->properties_.robustBufferAccess = false;
++      REXLOG_INFO("  robustBufferAccess disabled by vulkan_robust_buffer_access");
++    }
+     XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
+     XE_UI_VULKAN_FEATURE(independentBlend)
+     XE_UI_VULKAN_FEATURE(geometryShader)
+@@ -775,6 +789,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   if (device->extensions_.ext_EXT_robustness2) {
+     if (with_gpu_emulation) {
+       XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
++      if (!REXCVAR_GET(vulkan_robust_buffer_access)) {
++        // NVK bounds-checks every UBO/SSBO access when nullDescriptor is on, too.
++        features_EXT_robustness2.enabled.nullDescriptor = VK_FALSE;
++        device->properties_.nullDescriptor = false;
++        REXLOG_INFO("  nullDescriptor disabled by vulkan_robust_buffer_access");
++      }
+     }
+   }
+ 

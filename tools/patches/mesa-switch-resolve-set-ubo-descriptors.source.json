@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/R-drg/the-simpsons-game-nx",
+  "commit": "3cb2cdf7fa1665a1f2d653aa7502fe4baa03680f",
+  "path": "0001-nvk-switch-resolve-set-ubo-descriptors.patch",
+  "license": "MIT (Mesa changes, upstream attribution retained in source)"
+}

@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(mercenaries_memory_probe LANGUAGES C CXX ASM)
+set(CMAKE_CXX_STANDARD 23)
+add_executable(memory-probe main.cpp ../../../reference/masseffect-nx/sdk/src/core/guest_memory_switch.cpp)
+target_include_directories(memory-probe PRIVATE ../../../reference/masseffect-nx/sdk/src/core)
+target_link_libraries(memory-probe PRIVATE nx m)
+add_custom_command(TARGET memory-probe POST_BUILD COMMAND /opt/devkitpro/tools/bin/elf2nro $<TARGET_FILE:memory-probe> ${CMAKE_CURRENT_BINARY_DIR}/memory-probe.nro)

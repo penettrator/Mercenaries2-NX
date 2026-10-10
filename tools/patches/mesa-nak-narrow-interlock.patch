@@ -1,0 +1,127 @@
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index beb01b1d9db..bdd94a62b6e 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -203,8 +203,19 @@ nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
+       LOOP_OPT(nir, nir_opt_dce);
+       LOOP_OPT(nir, nir_opt_cse);
+ 
++      /* Port: NAK is the Mesa driver that flattens branches the least. With limit = 0 it only
++       * flattens ifs with both sides empty; ANV uses 8 and so does RADV. And NAK has no
++       * if-to-predicate pass, so every if that survives NIR becomes a real branch
++       * (SSY/BRA/SYNC) on Maxwell.
++       *
++       * In this game that matters a lot: the frame is pure shading, ~300 operations per
++       * fragment, and the scene runs at 31 % of the GPU's arithmetic peak. The shader translator
++       * already went from 1806 to 334 branches; the remaining ones have to be flattened by the driver.
++       *
++       * Watch with NVK_SHADER_STATS=1: flattening raises register pressure, and on GM20B a spill
++       * to local memory is very expensive. If "B of local memory" goes above 0, go back to 0. */
+       nir_opt_peephole_select_options peephole_select_options = {
+-         .limit = 0,
++         .limit = 8,
+          .discard_ok = true,
+       };
+       LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_peephole_select,
+@@ -1604,6 +1615,60 @@ nak_nir_lower_interlock(nir_shader *nir, const struct nak_compiler *nak)
+       nir_lower_is_helper_invocation(nir);
+    }
+ 
++   /* Port: the ticket wait used to sit at the top of the shader and the
++    * release at the very end, whatever the shader declared. That serialises
++    * texture fetches and ALU work of overlapping tiles too, not only the
++    * ordered EDRAM read-modify-write that Xenos FSI emulation protects.
++    *
++    * When Begin and End are each executed exactly once on the outermost
++    * control flow level (the SPIR-V extension already requires "exactly once
++    * per invocation"; outermost level means every lane of the warp reaches
++    * them together), wait at Begin and release at End instead. Anything else
++    * (several markers, markers inside branches or loops, End before Begin,
++    * markers wrapped by nir_lower_returns) keeps the whole-shader section.
++    *
++    * Demote handling is unchanged: demotes are still deferred to one final
++    * demote after the release, so a warp can never lose its releasing lane.
++    * The ticket and affinity are still read at shader start. */
++   nir_intrinsic_instr *interlock_begin = NULL;
++   nir_intrinsic_instr *interlock_end = NULL;
++   unsigned interlock_begin_count = 0, interlock_end_count = 0;
++   nir_foreach_block(block, impl) {
++      nir_foreach_instr(instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++         if (intrin->intrinsic == nir_intrinsic_begin_invocation_interlock) {
++            interlock_begin = intrin;
++            interlock_begin_count++;
++         } else if (intrin->intrinsic == nir_intrinsic_end_invocation_interlock) {
++            interlock_end = intrin;
++            interlock_end_count++;
++         }
++      }
++   }
++
++   bool narrow = false;
++   if (interlock_begin_count == 1 && interlock_end_count == 1 &&
++       interlock_begin->instr.block->cf_node.parent == &impl->cf_node &&
++       interlock_end->instr.block->cf_node.parent == &impl->cf_node) {
++      nir_metadata_require(impl, nir_metadata_block_index);
++      nir_block *begin_block = interlock_begin->instr.block;
++      nir_block *end_block = interlock_end->instr.block;
++      if (begin_block->index < end_block->index) {
++         narrow = true;
++      } else if (begin_block == end_block) {
++         nir_foreach_instr(instr, begin_block) {
++            if (instr == &interlock_end->instr)
++               break;
++            if (instr == &interlock_begin->instr) {
++               narrow = true;
++               break;
++            }
++         }
++      }
++   }
++
+    nir_foreach_block(block, impl) {
+       nir_foreach_instr_safe(instr, block) {
+          if (instr->type != nir_instr_type_intrinsic)
+@@ -1612,7 +1677,10 @@ nak_nir_lower_interlock(nir_shader *nir, const struct nak_compiler *nak)
+          switch (intrin->intrinsic) {
+          case nir_intrinsic_begin_invocation_interlock:
+          case nir_intrinsic_end_invocation_interlock:
+-            nir_instr_remove(instr);
++            /* Narrow markers are removed after the wait and release are
++             * placed at them. */
++            if (!narrow)
++               nir_instr_remove(instr);
+             break;
+          case nir_intrinsic_demote:
+          case nir_intrinsic_demote_if:
+@@ -1640,6 +1708,8 @@ nak_nir_lower_interlock(nir_shader *nir, const struct nak_compiler *nak)
+    nir_def *increment = nir_iadd_imm(&b, nir_iand_imm(&b, ticket, 0xfe00), 0x200);
+ 
+    /* Cover early returns and discard with one interlock per invocation. */
++   if (narrow)
++      b.cursor = nir_before_instr(&interlock_begin->instr);
+    nir_def *mask = nak_interlock_live_mask(&b);
+    nir_def *lane = nak_nir_load_sysval(&b, NAK_SV_LANE_ID, ACCESS_CAN_REORDER);
+    nir_push_if(&b, nir_ieq(&b, lane, nir_ufind_msb(&b, mask)));
+@@ -1657,9 +1727,17 @@ nak_nir_lower_interlock(nir_shader *nir, const struct nak_compiler *nak)
+                .memory_semantics = NIR_MEMORY_ACQUIRE,
+                .memory_modes = nir_var_mem_global);
+ 
+-   b.cursor = final_demote ? nir_before_instr(&final_demote->instr)
+-                           : nir_after_impl(impl);
++   if (narrow) {
++      b.cursor = nir_before_instr(&interlock_end->instr);
++   } else {
++      b.cursor = final_demote ? nir_before_instr(&final_demote->instr)
++                              : nir_after_impl(impl);
++   }
+    nak_interlock_release(&b, addr, increment);
++   if (narrow) {
++      nir_instr_remove(&interlock_begin->instr);
++      nir_instr_remove(&interlock_end->instr);
++   }
+    return nir_progress(true, impl, nir_metadata_none);
+ }
+ 

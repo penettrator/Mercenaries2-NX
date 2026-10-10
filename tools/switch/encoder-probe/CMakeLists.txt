@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(encoder_probe LANGUAGES C CXX ASM)
+set(CMAKE_CXX_STANDARD 23)
+add_executable(encoder-probe main.cpp)
+target_include_directories(encoder-probe PRIVATE ../../../reference/masseffect-nx/sdk/include ../../../reference/masseffect-nx/sdk/thirdparty/simde)
+target_link_libraries(encoder-probe PRIVATE nx m)
+add_custom_command(TARGET encoder-probe POST_BUILD COMMAND /opt/devkitpro/tools/bin/elf2nro $<TARGET_FILE:encoder-probe> ${CMAKE_CURRENT_BINARY_DIR}/encoder-probe.nro)

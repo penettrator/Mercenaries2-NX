@@ -1,0 +1,29 @@
+# Baseline discovery only. No Mass Effect hooks or overrides apply to this title.
+[project]
+name = "mercenaries2"
+sdk_version = "0.10.0"
+game_root = "../assets/game_root"
+
+[entrypoint]
+file_path = "../assets/game_root/default.xex"
+out_directory_path = "generated/default"
+
+# HANDOFF B:127: register localisation (keep PPC registers in C++ locals instead of the ctx struct).
+# Stage 1. Baseline (no flags) saved in out/snapshots/generated-baseline-2026-10-10.
+# setjmp-like context save sub_828670B0 (one caller, Lua-style protected call) and context restore
+# sub_828741FC exist; a non-local return through them cannot work in the recompiled code anyway.
+non_volatile_as_local = true
+cr_as_local = true
+ctr_as_local = true
+xer_as_local = true
+skip_msr = true
+
+# Inline because upstream 0.10.0 cannot open included TOMLs under a Cyrillic
+# Windows path. Details and evidence in analysis_overrides.toml.
+[entrypoint.functions]
+"0x828892C0" = { }
+# sub_8223D180 branches to a non-contiguous leaf tail at 0x8223D340.
+# Baseline output emits its instructions and labels through blr at 0x8223D450,
+# but conditional branches inside that tail remain unresolved. Register its
+# ownership explicitly instead of widening the parent over intervening functions.
+"0x8223D340" = { parent = 0x8223D180, size = 0x114 }

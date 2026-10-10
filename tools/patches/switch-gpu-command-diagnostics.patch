@@ -1,0 +1,65 @@
+diff --git a/sdk/src/graphics/command_processor.cpp b/sdk/src/graphics/command_processor.cpp
+index 4870c8d..ca757ab 100644
+--- a/sdk/src/graphics/command_processor.cpp
++++ b/sdk/src/graphics/command_processor.cpp
+@@ -13,6 +13,9 @@
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
++#if REX_PLATFORM_SWITCH
++#include <cstdio>
++#endif
+ #include <string_view>
+ 
+ #include <fmt/format.h>
+@@ -699,10 +702,38 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+   // Execute commands!
+   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+   reader.set_write_offset(count * sizeof(uint32_t));
++#if REX_PLATFORM_SWITCH
++      static const bool dump_enabled = [] {
++        FILE* flag = std::fopen("/switch/Mercenaries2/emulator_memory_test.flag", "r");
++        if (!flag) return false;
++        std::fclose(flag);
++        return true;
++      }();
++  std::vector<uint8_t> original_stream;
++  if (dump_enabled && count && count <= 0x40000)
++    original_stream.assign(reader.buffer(), reader.buffer() + count * sizeof(uint32_t));
++#endif
+   do {
+     if (!ExecutePacket(&reader)) {
+       // Return up a level if we encounter a bad packet.
+-      REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
++      REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet. ptr={:08X}, words={}, read_offset={}",
++                   ptr, count, reader.read_offset());
++#if REX_PLATFORM_SWITCH
++      // Preserve the failing stream only in the owned emulator diagnostic mode.
++      if (dump_enabled && count && count <= 0x40000) {
++        char path[160];
++        std::snprintf(path, sizeof(path), "/switch/Mercenaries2/bad-indirect-%08X-%08X.bin", ptr, count);
++        if (FILE* dump = std::fopen(path, "wb")) {
++          std::fwrite(reader.buffer(), sizeof(uint32_t), count, dump);
++          std::fclose(dump);
++        }
++        std::snprintf(path, sizeof(path), "/switch/Mercenaries2/bad-indirect-%08X-%08X-entry.bin", ptr, count);
++        if (FILE* dump = std::fopen(path, "wb")) {
++          std::fwrite(original_stream.data(), 1, original_stream.size(), dump);
++          std::fclose(dump);
++        }
++      }
++#endif
+       assert_always();
+       break;
+     }
+@@ -755,8 +786,8 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+ 
+   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+   if (reader->read_count() < count * sizeof(uint32_t)) {
+-    REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
+-                 reader->read_count(), count * sizeof(uint32_t));
++    REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X}, header={:08X}, offset={})",
++                 reader->read_count(), count * sizeof(uint32_t), packet, reader->read_offset());
+     return false;
+   }
+ 

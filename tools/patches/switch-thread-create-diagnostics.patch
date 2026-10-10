@@ -1,0 +1,60 @@
+diff --git a/sdk/src/core/threading_posix.cpp b/sdk/src/core/threading_posix.cpp
+index 425b53b..6d47d1e 100644
+--- a/sdk/src/core/threading_posix.cpp
++++ b/sdk/src/core/threading_posix.cpp
+@@ -849,7 +849,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     pthread_attr_t attr;
+     if (pthread_attr_init(&attr) != 0)
+       return false;
+-    if (pthread_attr_setstacksize(&attr, params.stack_size) != 0) {
++    const int stack_result = pthread_attr_setstacksize(&attr, params.stack_size);
++    if (stack_result != 0) {
++      REXLOG_ERROR("pthread_attr_setstacksize failed: error={}, stack_size={}",
++                   stack_result, params.stack_size);
+       pthread_attr_destroy(&attr);
+       return false;
+     }
+@@ -865,7 +868,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+         return false;
+       }
+     }
+-    if (pthread_create(&thread_, &attr, ThreadStartRoutine, start_data) != 0) {
++    const int create_result = pthread_create(&thread_, &attr, ThreadStartRoutine, start_data);
++    if (create_result != 0) {
++      REXLOG_ERROR("pthread_create failed: error={}, stack_size={}, priority={}",
++                   create_result, params.stack_size, params.initial_priority);
+       pthread_attr_destroy(&attr);
+       return false;
+     }
+diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
+index 1976e72..52e6a8b 100644
+--- a/sdk/src/ui/switch_perf.cpp
++++ b/sdk/src/ui/switch_perf.cpp
+@@ -48,6 +48,7 @@
+ #include <vector>
+ 
+ #include <switch.h>
++#include <malloc.h>
+ 
+ #include "rex/ui/switch_apm.h"
+ #include "rex/ui/switch_saltynx.h"
+@@ -1034,6 +1035,19 @@ Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_m
+   const Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
+   if (R_SUCCEEDED(rc) && t) {
+     Register(t->handle);
++  } else if (R_FAILED(rc)) {
++    // pthread maps several distinct Horizon failures to ENOMEM. Keep the
++    // original result and heap counters so allocation and mapping failures
++    // can be distinguished without altering thread behavior.
++    const auto heap = mallinfo();
++    char path[1024];
++    std::snprintf(path, sizeof(path), "%sthread_create.log", RexSwitchLogDir());
++    if (FILE* f = std::fopen(path, "a")) {
++      std::fprintf(f, "threadCreate result=0x%08X stack=%zu priority=%d core=%d "
++                      "heap_used=%d heap_free=%d largest_tail=%d\n",
++                   rc, stack_sz, prio, cpuid, heap.uordblks, heap.fordblks, heap.keepcost);
++      std::fclose(f);
++    }
+   }
+   return rc;
+ }

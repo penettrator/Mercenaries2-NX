@@ -1,0 +1,13 @@
+# Готовые файлы для вкладки Releases, в git не входят
+release/
+# Файлы игры и всё, что сделано из них
+assets/
+*.iso
+*.xex
+app/generated/
+# Внешние репозитории, инструменты, сборка
+reference/
+tools/bin/
+out/
+__pycache__/
+*.keys

@@ -1,0 +1,117 @@
+{
+  "revision": "8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b",
+  "license": "BSD-3-Clause, Xenia",
+  "source": "https://github.com/xenia-canary/xenia-canary/pull/898",
+  "files": {
+    "LICENSE": {
+      "sha256": "369ea6b0f7ba57544067e9d470ca82a927da787fb0a749b11cb55f1fd0ba47ae",
+      "bytes": 1481,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/LICENSE"
+    },
+    "src/xenia/gpu/shaders/resolve_full_128bpp_scaled.cs.xesl": {
+      "sha256": "22b5884f3a28bc62261f2d73b0e8d6632d21e8cee1a21517ddb459b1a2664aca",
+      "bytes": 74,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_128bpp_scaled.cs.xesl"
+    },
+    "src/xenia/gpu/shaders/resolve_full_128bpp.xesli": {
+      "sha256": "e857760e960e51890f596f7f27ac10671812a1e2bd5fdbf6393f4668aafd30ca",
+      "bytes": 3033,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_128bpp.xesli"
+    },
+    "src/xenia/gpu/shaders/resolve.xesli": {
+      "sha256": "9f724cbabdddc87a6219e1a12df467a4dce15d37f7aad70ce9a4c4de9bdef0c2",
+      "bytes": 37017,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve.xesli"
+    },
+    "src/xenia/gpu/shaders/texture_address.xesli": {
+      "sha256": "f72d04cb599cf9f607dff66b7e677b7cd8ac261ad2e29fb8556821c57fea4fd1",
+      "bytes": 11016,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/texture_address.xesli"
+    },
+    "src/xenia/ui/shaders/xesl.xesli": {
+      "sha256": "7ae2017e13678b961f3f9191f42544bc772ed7b89000d04b4156f525ddb90ed5",
+      "bytes": 53120,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/ui/shaders/xesl.xesli"
+    },
+    "src/xenia/gpu/shaders/pixel_formats.xesli": {
+      "sha256": "81dab373e1b9ad7b7a31ccc76581cfa203e45e9f0c8f837a1c47f4be0b3b7471",
+      "bytes": 46215,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/pixel_formats.xesli"
+    },
+    "src/xenia/gpu/shaders/edram.xesli": {
+      "sha256": "c9916c317a19816c71a62cd9042dfa3ba641744d2b67650d9889fb49358fa780",
+      "bytes": 2737,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/edram.xesli"
+    },
+    "src/xenia/gpu/shaders/endian.xesli": {
+      "sha256": "a2bae617ba27371d6b881808ab1fc29621ef043c83bde0ded8b70e2642743108",
+      "bytes": 2529,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/endian.xesli"
+    },
+    "src/xenia/gpu/shaders/resolve_full_128bpp.cs.xesl": {
+      "sha256": "b4b8f3705e06a1d6cc715db831f4d86bc7e32937202355051f671a5b0e6b6c84",
+      "bytes": 37,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_128bpp.cs.xesl"
+    },
+    "src/xenia/gpu/shaders/resolve_full_64bpp_scaled.cs.xesl": {
+      "sha256": "056e9c5f0bd5ff76773dedebc8ce4ecc85ccc4ff4aa92ca4c7308aeeb1a1ff8b",
+      "bytes": 73,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_64bpp_scaled.cs.xesl"
+    },
+    "src/xenia/gpu/shaders/resolve_full_64bpp.xesli": {
+      "sha256": "6ebaf3d1053c6c5bbc0cfc9c8b05a155d8e370a22ad11421dd4997b83c334399",
+      "bytes": 2778,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_64bpp.xesli"
+    },
+    "src/xenia/gpu/shaders/resolve_full_64bpp.cs.xesl": {
+      "sha256": "b73b2880f4cfa959e0630aae239fa5e05aac2f7407c2728ba6a6d213b37a7307",
+      "bytes": 36,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_64bpp.cs.xesl"
+    },
+    "src/xenia/gpu/shaders/resolve_full_32bpp_scaled.cs.xesl": {
+      "sha256": "3404e0d812eaa14946dd390cb2405e253ee9b86d92d6c79fb7bf4e82b6a1ba49",
+      "bytes": 73,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_32bpp_scaled.cs.xesl"
+    },
+    "src/xenia/gpu/shaders/resolve_full_32bpp.xesli": {
+      "sha256": "4857c3936abb7c495254fd8be7f2f4bfd26fdfde52dc6e2a1674c8ce81fcf1ee",
+      "bytes": 2611,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_32bpp.xesli"
+    },
+    "src/xenia/gpu/shaders/resolve_full_32bpp.cs.xesl": {
+      "sha256": "19246f74831ed204d0969f75e112556ff1682440679eca17dadd88dcca4e3d3e",
+      "bytes": 36,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_32bpp.cs.xesl"
+    },
+    "src/xenia/gpu/shaders/resolve_full_16bpp_scaled.cs.xesl": {
+      "sha256": "cbd2090b68f6760a02305f10ffe1cb36cc64cbb7a0c8310975f55a374660aed7",
+      "bytes": 73,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_16bpp_scaled.cs.xesl"
+    },
+    "src/xenia/gpu/shaders/resolve_full_16bpp.xesli": {
+      "sha256": "bd940af08ebb995454c9adbb8a0f4f730d9c86318772a7d1871fabf089dd9826",
+      "bytes": 2590,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_16bpp.xesli"
+    },
+    "src/xenia/gpu/shaders/resolve_full_16bpp.cs.xesl": {
+      "sha256": "d41c96b94fc593aae8ac0000fed868610c2954bd2c844ab5b2656dfc189cbb70",
+      "bytes": 36,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_16bpp.cs.xesl"
+    },
+    "src/xenia/gpu/shaders/resolve_full_8bpp_scaled.cs.xesl": {
+      "sha256": "a1bdd159c569edd9d5718b3aaed34c97fdf5e4b9b533a8863fa080bd70166e25",
+      "bytes": 72,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_8bpp_scaled.cs.xesl"
+    },
+    "src/xenia/gpu/shaders/resolve_full_8bpp.xesli": {
+      "sha256": "5ae669f1b0351f85cf0b5cc6f0e6c97eaf2bfe5f68ea254bb05decbdcacb4108",
+      "bytes": 2497,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_8bpp.xesli"
+    },
+    "src/xenia/gpu/shaders/resolve_full_8bpp.cs.xesl": {
+      "sha256": "2fa2b0fbdf5ae4700ec616a60284ee3d30e4127f78b1fdbd2dbf6ddcc03d5254",
+      "bytes": 35,
+      "url": "https://raw.githubusercontent.com/xenia-canary/xenia-canary/8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b/src/xenia/gpu/shaders/resolve_full_8bpp.cs.xesl"
+    }
+  }
+}

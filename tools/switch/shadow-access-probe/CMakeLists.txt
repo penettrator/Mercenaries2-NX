@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(mercenaries_shadow_access_probe LANGUAGES C CXX ASM)
+set(CMAKE_CXX_STANDARD 23)
+add_executable(shadow-access-probe main.cpp ../../../reference/masseffect-nx/sdk/src/core/guest_memory_switch.cpp)
+target_include_directories(shadow-access-probe PRIVATE ../../../reference/masseffect-nx/sdk/src/core)
+target_link_libraries(shadow-access-probe PRIVATE nx m)
+add_custom_command(TARGET shadow-access-probe POST_BUILD COMMAND /opt/devkitpro/tools/bin/elf2nro $<TARGET_FILE:shadow-access-probe> ${CMAKE_CURRENT_BINARY_DIR}/shadow-access-probe.nro)

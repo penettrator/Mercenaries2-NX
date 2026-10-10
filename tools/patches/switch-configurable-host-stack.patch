@@ -1,0 +1,18 @@
+diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
+index c2903c0..eeb0815 100644
+--- a/sdk/src/system/xthread.cpp
++++ b/sdk/src/system/xthread.cpp
+@@ -464,7 +464,13 @@ X_STATUS XThread::Create() {
+   RetainHandle();
+ 
+   rex::thread::Thread::CreationParameters params;
++#if REX_PLATFORM_SWITCH && defined(REX_SWITCH_HOST_STACK_MB)
++  // Translated PPC frames use this host stack in addition to the guest stack.
++  // Allow each port to budget it; preserve the SDK default on other targets.
++  params.stack_size = size_t(REX_SWITCH_HOST_STACK_MB) * 1024 * 1024;
++#else
+   params.stack_size = 16_MiB;  // Allocate a big host stack.
++#endif
+   params.create_suspended = true;
+   thread_ = rex::thread::Thread::Create(params, [this]() {
+     rex::initialize_seh_thread();

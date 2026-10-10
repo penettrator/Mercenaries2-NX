@@ -1,0 +1,181 @@
+--- a/sdk/src/ui/vulkan/vulkan_device.cpp
++++ b/sdk/src/ui/vulkan/vulkan_device.cpp
+@@ -21,6 +21,7 @@
+ #include <rex/platform.h>
+ #include <rex/string.h>
+ #include <rex/ui/vulkan/device.h>
++#include <rex/ui/vulkan/switch_shader_stats.h>
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_native_shader_features, false, "UI/Vulkan",
+                     "Enable available capabilities for the experimental native shaders")
+@@ -173,6 +174,10 @@
+ #define XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(name, major, minor) \
+   request_promoted_extension("VK_" #name, major, minor, &ext_##major##_##minor##_##name);
+ 
++  bool ext_KHR_pipeline_executable_properties = false;
++  if (get_physical_device_properties2_supported && SwitchShaderStatsRequested()) {
++    XE_UI_VULKAN_LOCAL_EXTENSION(KHR_pipeline_executable_properties)
++  }
+   bool ext_KHR_portability_subset = false;
+   bool ext_1_2_KHR_driver_properties = false;
+   if (get_physical_device_properties2_supported) {
+@@ -349,6 +354,13 @@
+                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT>
+       features_EXT_extended_dynamic_state3;
+ 
++  VulkanFeatures<VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
++                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR>
++      features_KHR_pipeline_executable_properties;
++  if (ext_KHR_pipeline_executable_properties) {
++    features_KHR_pipeline_executable_properties.Link(supported_features_2, device_create_info);
++  }
++
+   if (get_physical_device_properties2_supported) {
+     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+       features_1_2.Link(supported_features_2, device_create_info);
+@@ -775,6 +787,11 @@
+     XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorWriteMask)
+   }
+ 
++  if (ext_KHR_pipeline_executable_properties) {
++    features_KHR_pipeline_executable_properties.enabled.pipelineExecutableInfo =
++        features_KHR_pipeline_executable_properties.supported.pipelineExecutableInfo;
++  }
++
+ #undef XE_UI_VULKAN_LIMIT
+ #undef XE_UI_VULKAN_ENUM_LIMIT
+ #undef XE_UI_VULKAN_FEATURE
+@@ -821,6 +838,13 @@
+ #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
+   }
+ #undef XE_UI_VULKAN_FUNCTION_PROMOTED
++
++  if (SwitchShaderStatsRequested()) {
++    const bool enabled = ext_KHR_pipeline_executable_properties &&
++        features_KHR_pipeline_executable_properties.enabled.pipelineExecutableInfo;
++    if (enabled) switch_shader_stats_device.store(device->device_, std::memory_order_release);
++    REXLOG_INFO("SHADER_STATS requested=1 enabled={}", enabled ? 1 : 0);
++  }
+ 
+   // Non-promoted extensions, and extensions promoted to a Vulkan version not
+   // supported by the device.
+--- a/sdk/src/graphics/vulkan/pipeline_cache.cpp
++++ b/sdk/src/graphics/vulkan/pipeline_cache.cpp
+@@ -48,6 +48,7 @@
+ #include <rex/math.h>
+ #include <rex/types.h>
+ #include <rex/ui/vulkan/util.h>
++#include <rex/ui/vulkan/switch_shader_stats.h>
+ 
+ #if REX_PLATFORM_SWITCH
+ #include "../../core/threading_switch.h"
+@@ -3562,11 +3563,25 @@
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
++  const uint64_t stats_ps = description.pixel_shader_hash;
++  const bool capture_stats =
++      ui::vulkan::switch_shader_stats_device.load(std::memory_order_acquire) == device &&
++      (stats_ps == 0x3E0AB1A6A7CD8CFBull || stats_ps == 0x9AD799B034BB706Full ||
++       stats_ps == 0x952E55BBBE85A6F4ull || stats_ps == 0xC45C07BB16BF2E70ull);
++  if (capture_stats) pipeline_create_info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+ #if REX_PLATFORM_SWITCH
+   RexSwitchPerfCount(16);
+ #endif
+   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
++  if (create_result != VK_SUCCESS && capture_stats) {
++    // Diagnostics must not prevent a pipeline from running: retry normal creation.
++    REXLOG_WARN("SHADER_STATS capture creation failed result={} ps={:016X}; retry universal creation",
++                int32_t(create_result), stats_ps);
++    pipeline_create_info.flags &= ~VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
++    create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++                                                 &pipeline_create_info, nullptr, &pipeline);
++  }
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+@@ -3581,6 +3596,57 @@
+         creation_arguments.tessellation_patch_control_points, description.render_pass_key.key,
+         uint32_t(use_dynamic_rendering));
+     return false;
++  }
++  if (capture_stats && (pipeline_create_info.flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR)) {
++    // Resolve separately: never add slots to the SDK's shared device function table.
++    const auto get_proc = vulkan_device->vulkan_instance()->functions().vkGetDeviceProcAddr;
++    const auto get_properties = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
++        get_proc(device, "vkGetPipelineExecutablePropertiesKHR"));
++    const auto get_statistics = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
++        get_proc(device, "vkGetPipelineExecutableStatisticsKHR"));
++    if (get_properties && get_statistics) {
++      VkPipelineInfoKHR info{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
++      info.pipeline = pipeline;
++      uint32_t count = 0;
++      VkResult result = get_properties(device, &info, &count, nullptr);
++      if (result == VK_SUCCESS && count && count <= 16) {
++        std::vector<VkPipelineExecutablePropertiesKHR> properties(count);
++        for (auto& property : properties) property.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
++        result = get_properties(device, &info, &count, properties.data());
++        if (result == VK_SUCCESS) {
++          for (uint32_t index = 0; index < count; ++index) {
++            VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
++            executable.pipeline = pipeline;
++            executable.executableIndex = index;
++            uint32_t statistic_count = 0;
++            result = get_statistics(device, &executable, &statistic_count, nullptr);
++            if (result != VK_SUCCESS || !statistic_count || statistic_count > 64) {
++              REXLOG_WARN("SHADER_STATS query failed result={} ps={:016X} executable={}",
++                          int32_t(result), stats_ps, index);
++              continue;
++            }
++            std::vector<VkPipelineExecutableStatisticKHR> statistics(statistic_count);
++            for (auto& statistic : statistics) statistic.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
++            result = get_statistics(device, &executable, &statistic_count, statistics.data());
++            if (result != VK_SUCCESS) continue;
++            for (uint32_t stat_index = 0; stat_index < statistic_count; ++stat_index) {
++              const auto& statistic = statistics[stat_index];
++              // NVK exposes these counters as uint64. Preserve format for other drivers.
++              if (statistic.format != VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR) continue;
++              REXLOG_INFO("SHADER_STATS vs={:016X} vs_mod={:016X} ps={:016X} ps_mod={:016X} placeholder={} executable={} stages=0x{:X} subgroup={} name=\"{}\" value={}",
++                          description.vertex_shader_hash, description.vertex_shader_modification,
++                          stats_ps, description.pixel_shader_modification, creating_placeholder ? 1 : 0,
++                          index, uint32_t(properties[index].stages), properties[index].subgroupSize,
++                          statistic.name, statistic.value.u64);
++            }
++          }
++        }
++      } else {
++        REXLOG_WARN("SHADER_STATS properties failed result={} ps={:016X} count={}", int32_t(result), stats_ps, count);
++      }
++    } else {
++      REXLOG_WARN("SHADER_STATS entrypoints unavailable ps={:016X}", stats_ps);
++    }
+   }
+   bool was_placeholder =
+       creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+--- /dev/null
++++ b/sdk/include/rex/ui/vulkan/switch_shader_stats.h
+@@ -0,0 +1,23 @@
++#pragma once
++// Opt-in diagnostics only. No shared Vulkan function-table or class layout changes.
++#include <atomic>
++#include <cstdio>
++#include <rex/platform.h>
++#include <rex/ui/vulkan/device.h>
++namespace rex::ui::vulkan {
++inline bool SwitchShaderStatsRequested() {
++#if REX_PLATFORM_SWITCH
++  static const bool requested = [] {
++    FILE* file = std::fopen("sdmc:/switch/Mercenaries2/logs/rex/shader_stats.flag", "rb");
++    if (!file) return false;
++    std::fclose(file);
++    return true;
++  }();
++  return requested;
++#else
++  return false;
++#endif
++}
++// Published only after successful device creation with pipelineExecutableInfo enabled.
++inline std::atomic<VkDevice> switch_shader_stats_device{VK_NULL_HANDLE};
++}

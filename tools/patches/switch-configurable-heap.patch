@@ -1,0 +1,16 @@
+--- a/sdk/src/ui/runtime_switch.cpp
++++ b/sdk/src/ui/runtime_switch.cpp
+@@ -94,7 +94,12 @@
+  * asks for) and leave the rest free for the mappings. What the GPU uses
+  * (textures, buffers and compiled shaders) does not come from here.
+  */
+-size_t __nx_heap_size = 1024ull * 1024 * 1024;  /* see below */
++#ifndef REX_SWITCH_HEAP_MB
++#define REX_SWITCH_HEAP_MB 1024
++#endif
++// A title using the generic Xenos GPU can select a larger capped heap: the
++// Horizon NVK backing allocations also come from memalign in this heap.
++size_t __nx_heap_size = uint64_t(REX_SWITCH_HEAP_MB) * 1024 * 1024;
+ 
+ /*
+  * The exception handler stack is no longer declared here.

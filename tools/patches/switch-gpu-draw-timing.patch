@@ -1,0 +1,328 @@
+--- a/sdk/include/rex/graphics/vulkan/command_processor.h
++++ b/sdk/include/rex/graphics/vulkan/command_processor.h
+@@ -837,6 +837,29 @@
+   // System shader constants.
+   SpirvShaderTranslator::SystemConstants system_constants_;
+ 
++#if REX_PLATFORM_SWITCH
++  struct DrawTimingSample {
++    uint64_t vs, ps;
++    uint32_t vertices, pitch;
++  };
++  struct DrawTimingSlot {
++    VkQueryPool pool = VK_NULL_HANDLE;
++    uint64_t submission = 0;
++    std::vector<DrawTimingSample> samples;
++  };
++  std::array<DrawTimingSlot, 8> draw_timing_slots_;
++  uint64_t draw_timing_counter_ = 0;
++  uint32_t draw_timing_current_ = UINT32_MAX;
++  uint32_t draw_timing_valid_bits_ = 0;
++  float draw_timing_period_ = 0;
++  bool draw_timing_checked_ = false;
++  bool draw_timing_enabled_ = false;
++  uint32_t BeginDrawTiming(uint64_t vs, uint64_t ps, uint32_t vertices, uint32_t pitch);
++  void EndDrawTiming(uint32_t sample);
++  void CollectDrawTimings();
++  void ShutdownDrawTimings();
++#endif
++
+   // Temporary storage for memexport stream constants used in the draw.
+   std::vector<draw_util::MemExportRange> memexport_ranges_;
+ };
+--- a/sdk/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/sdk/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -27,6 +27,13 @@
+  public:
+   DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
+                         size_t initial_size_bytes = 1024 * 1024);
++
++  // Diagnostic GPU completion markers; the caller owns query pool lifetime.
++  void CmdVkWriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool pool, uint32_t query) {
++    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
++        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
++    args.stage = stage; args.pool = pool; args.query = query;
++  }
+ 
+   void Reset();
+   void Execute(VkCommandBuffer command_buffer);
+@@ -374,6 +381,7 @@
+     kVkPipelineBarrier,
+     kVkPushConstants,
+     kVkResetQueryPool,
++    kVkWriteTimestamp,
+     kVkSetBlendConstants,
+     kVkSetDepthBias,
+     kVkSetScissor,
+@@ -520,6 +528,11 @@
+     uint32_t query;
+   };
+ 
++  struct ArgsVkWriteTimestamp {
++    VkPipelineStageFlagBits stage;
++    VkQueryPool pool;
++    uint32_t query;
++  };
+   struct ArgsVkResetQueryPool {
+     VkQueryPool query_pool;
+     uint32_t first_query;
+--- a/sdk/src/graphics/vulkan/command_processor.cpp
++++ b/sdk/src/graphics/vulkan/command_processor.cpp
+@@ -13,6 +13,7 @@
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
++#include <cstdlib>
+ #include <iterator>
+ #include <mutex>
+ #include <string>
+@@ -788,6 +789,24 @@
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
++#if REX_PLATFORM_SWITCH
++  // Reject mismatched SDK function-table objects before invoking resource APIs.
++  const auto& instance_functions = vulkan_device->vulkan_instance()->functions();
++  const auto function_matches = [&](const char* name, PFN_vkVoidFunction stored) {
++    const auto expected = instance_functions.vkGetDeviceProcAddr(device, name);
++    if (!expected || expected != stored) {
++      REXGPU_ERROR("Vulkan function table ABI mismatch: {}. Rebuild all Vulkan modules.", name);
++      return false;
++    }
++    return true;
++  };
++  if (!function_matches("vkMapMemory", reinterpret_cast<PFN_vkVoidFunction>(dfn.vkMapMemory)) ||
++      !function_matches("vkGetBufferMemoryRequirements", reinterpret_cast<PFN_vkVoidFunction>(dfn.vkGetBufferMemoryRequirements)) ||
++      !function_matches("vkCreateQueryPool", reinterpret_cast<PFN_vkVoidFunction>(dfn.vkCreateQueryPool))) {
++    return false;
++  }
++  REXGPU_INFO("Vulkan function table ABI check passed (map, buffer requirements, query pool)");
++#endif
+ 
+   // The unconditional inclusion of the vertex shader stage also covers the case
+   // of manual index / factor buffer fetch (the system constants and the shared
+@@ -1908,6 +1927,9 @@
+   AwaitAllQueueOperationsCompletion();
+ #if REX_PLATFORM_SWITCH
+   if (RexNativeVideoShutdown) RexNativeVideoShutdown();
++#endif
++#if REX_PLATFORM_SWITCH
++  ShutdownDrawTimings();
+ #endif
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+@@ -4175,6 +4197,12 @@
+                                                   : 32u);
+   }
+ #endif
++#if REX_PLATFORM_SWITCH
++  const uint32_t timing_sample = RexSwitchPerfSkip(1) ? UINT32_MAX : BeginDrawTiming(
++      vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
++      primitive_processing_result.host_draw_vertex_count,
++      regs.Get<reg::RB_SURFACE_INFO>().surface_pitch);
++#endif
+   if (primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+       shader_32bit_index_dma) {
+@@ -4219,6 +4247,9 @@
+                                               0, 0, 0);
+   }
+ 
++#if REX_PLATFORM_SWITCH
++  EndDrawTiming(timing_sample);
++#endif
+   // Invalidate textures in memexported memory and watch for changes.
+   if (!memexport_ranges_.empty()) {
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+@@ -5019,6 +5050,8 @@
+   sample_counts->StencilFail_B = 0;
+ }
+ 
++#include "draw_timing_switch.inc"
++
+ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
+   // Only report once, no need to retry a wait that won't succeed anyway.
+   if (device_lost_) {
+@@ -5091,6 +5124,9 @@
+   submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
+                                       submissions_in_flight_fences_awaited_end);
+   submission_completed_ += fences_awaited;
++#if REX_PLATFORM_SWITCH
++  CollectDrawTimings();
++#endif
+ 
+   // Reclaim semaphores.
+   while (!submissions_in_flight_semaphores_.empty()) {
+@@ -5461,6 +5497,15 @@
+       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
+       return false;
+     }
++#if REX_PLATFORM_SWITCH
++    // Reset before replay, outside any render pass; pool has completed prior use.
++    if (draw_timing_current_ != UINT32_MAX) {
++      const auto& timing = draw_timing_slots_[draw_timing_current_];
++      if (timing.submission == GetCurrentSubmission() && !timing.samples.empty())
++        dfn.vkCmdResetQueryPool(command_buffer.buffer, timing.pool, 0,
++                              uint32_t(timing.samples.size()) * 2);
++    }
++#endif
+     deferred_command_buffer_.Execute(command_buffer.buffer);
+     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to end a Vulkan command buffer");
+--- a/sdk/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/sdk/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -266,6 +266,15 @@
+             reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsVkPushConstants));
+       } break;
+ 
++      case Command::kVkWriteTimestamp: {
++        const auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
++        const auto* dev = command_processor_.GetVulkanDevice();
++        const auto timestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(
++            dev->vulkan_instance()->functions().vkGetDeviceProcAddr(dev->device(), "vkCmdWriteTimestamp"));
++        // BeginDrawTiming checks support before recording any timestamp commands.
++        if (timestamp) timestamp(command_buffer, args.stage, args.pool, args.query);
++      } break;
++
+       case Command::kVkResetQueryPool: {
+         auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
+         dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,
+--- a/sdk/src/ui/switch_perf.cpp
++++ b/sdk/src/ui/switch_perf.cpp
+@@ -44,6 +44,7 @@
+ #include <cinttypes>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
+ #include <string>
+ #include <vector>
+ 
+@@ -231,6 +232,14 @@
+ std::atomic<u32> g_skip_mask{0};
+ 
+ extern "C" void RexSwitchPerfToggleAb(void) {
++  // Timing builds retain every command: the destructive skip test damaged the image.
++  const char* timing = std::getenv("MERCENARIES2_GPU_DRAW_TIMING");
++  if (timing && !std::strcmp(timing, "1")) {
++    g_ab_active.store(false, std::memory_order_relaxed);
++    g_skip_mask.store(0, std::memory_order_relaxed);
++    return;
++  }
++
+   const bool new_value = !g_ab_active.load(std::memory_order_relaxed);
+   g_ab_active.store(new_value, std::memory_order_relaxed);
+   if (!new_value) {
+--- /dev/null
++++ b/sdk/src/graphics/vulkan/draw_timing_switch.inc
+@@ -0,0 +1,111 @@
++#if REX_PLATFORM_SWITCH
++// Sparse GPU completion deltas, not isolated shader duration. All game work is retained.
++uint32_t VulkanCommandProcessor::BeginDrawTiming(uint64_t vs, uint64_t ps,
++                                                uint32_t vertices, uint32_t pitch) {
++  const auto* dev = GetVulkanDevice();
++  if (!draw_timing_checked_) {
++    draw_timing_checked_ = true;
++    const char* enabled = std::getenv("MERCENARIES2_GPU_DRAW_TIMING");
++    if (!enabled || std::strcmp(enabled, "1")) return UINT32_MAX;
++    const auto& ifn = dev->vulkan_instance()->functions();
++    uint32_t count = 0;
++    ifn.vkGetPhysicalDeviceQueueFamilyProperties(dev->physical_device(), &count, nullptr);
++    std::vector<VkQueueFamilyProperties> families(count);
++    ifn.vkGetPhysicalDeviceQueueFamilyProperties(dev->physical_device(), &count, families.data());
++    VkPhysicalDeviceProperties properties{};
++    ifn.vkGetPhysicalDeviceProperties(dev->physical_device(), &properties);
++    const uint32_t family = dev->queue_family_graphics_compute();
++    if (family >= count) return UINT32_MAX;
++    draw_timing_valid_bits_ = families[family].timestampValidBits;
++    draw_timing_period_ = properties.limits.timestampPeriod;
++    // Resolve optional diagnostics directly; do not change the shared Functions ABI.
++    const bool functions_available =
++        ifn.vkGetDeviceProcAddr(dev->device(), "vkCmdWriteTimestamp") &&
++        ifn.vkGetDeviceProcAddr(dev->device(), "vkGetQueryPoolResults");
++    draw_timing_enabled_ = functions_available && draw_timing_valid_bits_ > 0 && draw_timing_valid_bits_ <= 64 &&
++                           draw_timing_period_ > 0;
++    REXGPU_INFO("GPU_DRAW_TIMING enabled={} stride=127 max_samples=32 max_pools=8 bits={} period_ns={} metric=bottom_completion_delta",
++                draw_timing_enabled_, draw_timing_valid_bits_, draw_timing_period_);
++  }
++  if (!draw_timing_enabled_ || (++draw_timing_counter_ % 127) != 0) return UINT32_MAX;
++  if (draw_timing_current_ == UINT32_MAX ||
++      draw_timing_slots_[draw_timing_current_].submission != GetCurrentSubmission()) {
++    draw_timing_current_ = UINT32_MAX;
++    for (uint32_t i = 0; i < draw_timing_slots_.size(); ++i) {
++      auto& slot = draw_timing_slots_[i];
++      if (slot.submission) continue;
++      if (slot.pool == VK_NULL_HANDLE) {
++        VkQueryPoolCreateInfo info{};
++        info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++        info.queryCount = 64;
++        if (dev->functions().vkCreateQueryPool(dev->device(), &info, nullptr, &slot.pool) != VK_SUCCESS) {
++          draw_timing_enabled_ = false;
++          REXGPU_WARN("GPU_DRAW_TIMING disabled: query pool creation failed");
++          return UINT32_MAX;
++        }
++        slot.samples.reserve(32);
++      }
++      slot.submission = GetCurrentSubmission();
++      draw_timing_current_ = i;
++      break;
++    }
++  }
++  if (draw_timing_current_ == UINT32_MAX) return UINT32_MAX; // Never wait for diagnostic space.
++  auto& slot = draw_timing_slots_[draw_timing_current_];
++  if (slot.samples.size() >= 32) return UINT32_MAX;
++  uint32_t sample = uint32_t(slot.samples.size());
++  slot.samples.push_back({vs, ps, vertices, pitch});
++  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                                               slot.pool, sample * 2);
++  return sample;
++}
++
++void VulkanCommandProcessor::EndDrawTiming(uint32_t sample) {
++  if (sample == UINT32_MAX) return;
++  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++      draw_timing_slots_[draw_timing_current_].pool, sample * 2 + 1);
++}
++
++void VulkanCommandProcessor::CollectDrawTimings() {
++  const auto* dev = GetVulkanDevice();
++  for (auto& slot : draw_timing_slots_) {
++    if (!slot.submission || slot.submission > submission_completed_) continue;
++    uint64_t values[64][2]{}; // timestamp, availability
++    const uint32_t queries = uint32_t(slot.samples.size()) * 2;
++    const auto get_results = reinterpret_cast<PFN_vkGetQueryPoolResults>(
++        dev->vulkan_instance()->functions().vkGetDeviceProcAddr(dev->device(), "vkGetQueryPoolResults"));
++    VkResult status = get_results(dev->device(), slot.pool, 0, queries,
++        sizeof(values), values, sizeof(values[0]),
++        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++    const uint64_t mask = draw_timing_valid_bits_ == 64 ? UINT64_MAX :
++                          (uint64_t(1) << draw_timing_valid_bits_) - 1;
++    if (status == VK_SUCCESS) {
++      for (uint32_t i = 0; i < slot.samples.size(); ++i) {
++        if (!values[i*2][1] || !values[i*2+1][1]) continue;
++        const auto& s = slot.samples[i];
++        const uint64_t ticks = (values[i*2+1][0] - values[i*2][0]) & mask;
++        REXGPU_INFO("GPU_DRAW_SAMPLE submission={} vs={:016X} ps={:016X} vertices={} pitch={} ticks={} delta_us={:.3f}",
++            slot.submission, s.vs, s.ps, s.vertices, s.pitch, ticks,
++            double(ticks) * draw_timing_period_ / 1000.0);
++      }
++    } else {
++      REXGPU_WARN("GPU_DRAW_TIMING result discarded after completed fence: {}", int(status));
++    }
++    // Fence complete: pool may be reset/reused. No WAIT_BIT and no additional fence.
++    slot.samples.clear();
++    slot.submission = 0;
++  }
++}
++
++void VulkanCommandProcessor::ShutdownDrawTimings() {
++  const auto* dev = GetVulkanDevice();
++  // ShutdownContext has already waited for queue completion.
++  for (auto& slot : draw_timing_slots_) {
++    if (slot.pool != VK_NULL_HANDLE)
++      dev->functions().vkDestroyQueryPool(dev->device(), slot.pool, nullptr);
++    slot = {};
++  }
++  draw_timing_current_ = UINT32_MAX;
++}
++#endif

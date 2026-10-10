@@ -1,0 +1,49 @@
+diff --git a/shaders/XenosRecomp/shader_recompiler.cpp b/shaders/XenosRecomp/shader_recompiler.cpp
+index dacc7a5..08781fc 100644
+--- a/shaders/XenosRecomp/shader_recompiler.cpp
++++ b/shaders/XenosRecomp/shader_recompiler.cpp
+@@ -365,7 +365,10 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     {
+     case TextureDimension::Texture2D:
+         // The last argument is 1/size of the slot, so the texture does not have to be queried.
+-        print(", float2({}, {}), {}_InvSize", instr.offsetX * 0.5f, instr.offsetY * 0.5f, constNamePtr);
++        if (instr.opcode == FetchOpcode::GetTextureWeights)
++            print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
++        else
++            print(", float2({}, {}), {}_InvSize", instr.offsetX * 0.5f, instr.offsetY * 0.5f, constNamePtr);
+         break;
+     case TextureDimension::TextureCube:
+         out += ", cubeMapData";
+@@ -1509,9 +1512,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         {
+             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+             println("\t#define {} (1 << {})", constantName, constantInfo->registerIndex + (isPixelShader ? 16 : 0));
+-            // In MASSEFFECT CTAB numbers b0.. and CF uses 128.. for pixels.
+-            // The g_Booleans packing keeps its 16 bits per stage.
+-            boolConstants.emplace(constantInfo->registerIndex + (isPixelShader ? 128 : 0), constantName);
++            // CTAB can declare an array spanning multiple boolean registers.
++            // Mercenaries 2 uses b0..b3 (numPointLights), b4..b6 and b8.
++            // Register every element; CF uses 128.. for pixel boolean addresses.
++            const uint32_t first = constantInfo->registerIndex;
++            const uint32_t count = constantInfo->registerCount;
++            if (count == 0 || first + count > 16)
++                throw std::runtime_error("boolean declaration exceeds the shared constant ABI");
++            for (uint32_t element = 0; element < count; ++element)
++                boolConstants.emplace(first + element + (isPixelShader ? 128 : 0),
++                    uint32_t{1} << (first + element + (isPixelShader ? 16 : 0)));
+         }
+     }
+ 
+diff --git a/shaders/XenosRecomp/shader_recompiler.h b/shaders/XenosRecomp/shader_recompiler.h
+index e450e48..12fff2d 100644
+--- a/shaders/XenosRecomp/shader_recompiler.h
++++ b/shaders/XenosRecomp/shader_recompiler.h
+@@ -33,7 +33,7 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, VertexElement> vertexElements;
+     std::unordered_map<uint32_t, std::string> interpolators;
+     std::unordered_map<uint32_t, const ConstantInfo*> float4Constants;
+-    std::unordered_map<uint32_t, const char*> boolConstants;
++    std::unordered_map<uint32_t, uint32_t> boolConstants;
+     std::unordered_map<uint32_t, const char*> samplers;
+     // MASSEFFECT: float registers set by the definition table (literal c<N> locals); an undeclared
+     // register outside this set is read from the constant buffer directly.

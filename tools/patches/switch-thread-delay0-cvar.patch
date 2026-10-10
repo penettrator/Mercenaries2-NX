@@ -1,0 +1,33 @@
+--- a/sdk/src/system/xthread.cpp	2026-10-10 14:06:50.525515200 +0300
++++ b/sdk/src/system/xthread.cpp	2026-10-10 15:15:53.028211700 +0300
+@@ -49,6 +49,17 @@
+ REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
+                     "Ignores game-specified thread affinities");
+ 
++// Mercenaries 2 (HANDOFF B:125): the main thread waits for its job workers with Sleep(0); a host
++// sleep of 100 us per poll kept it asleep long after the job was done (run72: 23 % of its samples).
++REXCVAR_DEFINE_UINT32(thread_delay0_sleep_us, 100, "Kernel",
++                      "Host sleep in microseconds for a zero-length KeDelayExecutionThread of a "
++                      "below-normal priority thread (0 = yield the core instead)");
++// HANDOFF B:133: run79 - with 0 for every thread the idle job workers spun on sched_yield
++// (5 threads, 13-29 % CPU each, about one core in combat). Only the entry-point thread waits on
++// work it needs; it gets its own value.
++REXCVAR_DEFINE_UINT32(thread_delay0_main_sleep_us, 100, "Kernel",
++                      "Like thread_delay0_sleep_us, for the game's entry-point (main) thread only");
++
+ namespace rex::system {
+ 
+ const uint32_t XAPC::kSize;
+@@ -1078,8 +1089,10 @@
+     }
+   } else {
+     if (timeout_ms == 0) {
+-      if (priority_ <= rex::thread::ThreadPriority::kBelowNormal) {
+-        rex::thread::Sleep(std::chrono::microseconds(100));
++      const uint32_t delay0_us = main_thread_ ? REXCVAR_GET(thread_delay0_main_sleep_us)
++                                              : REXCVAR_GET(thread_delay0_sleep_us);
++      if (delay0_us && priority_ <= rex::thread::ThreadPriority::kBelowNormal) {
++        rex::thread::Sleep(std::chrono::microseconds(delay0_us));
+       } else {
+         rex::thread::MaybeYield();
+       }

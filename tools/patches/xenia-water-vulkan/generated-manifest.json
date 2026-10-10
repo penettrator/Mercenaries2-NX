@@ -1,0 +1,57 @@
+{
+  "source_revision": "8444a2b5a33a5ca41e5fb75b89f002b7a5b0583b",
+  "generator": "tools/build_water_vulkan.py",
+  "validation": "out/water-vulkan-build/validation.json",
+  "files": [
+    {
+      "file": "resolve_full_128bpp_cs.h",
+      "sha256": "129466ab89feb69e59a75a6187884e48b22157fd6541429b171ebc55699a5194",
+      "original_sha256": "1bf29b2464f0914732b2301c8623f3172a2e1252daac3e15b4438dc5e1e376c0"
+    },
+    {
+      "file": "resolve_full_128bpp_scaled_cs.h",
+      "sha256": "61d355d3b580f06c47115869f49a2017fae8137e831c8ee034df43bd13519a59",
+      "original_sha256": "6b43e906d59824ab2eddc3b894d0b672755344a6891a7e6e5a10d7375a5552bc"
+    },
+    {
+      "file": "resolve_full_16bpp_cs.h",
+      "sha256": "6048eff00aabbbea717793c35c46a8b26078b85da458803408565268d90356da",
+      "original_sha256": "08fbf1cfd2c9e2ca0b2724ba3dc22e7b76da8f503ea53f6d378b11bc1f58c7c9"
+    },
+    {
+      "file": "resolve_full_16bpp_scaled_cs.h",
+      "sha256": "692b2ed4ac2f9a45885b8721161804da96e6c269f220fcf1579f541b89cac1cd",
+      "original_sha256": "66a156766ccf9e3ebae1c61efbe978b1bf297572041647f7ddc2dbab54057f42"
+    },
+    {
+      "file": "resolve_full_32bpp_cs.h",
+      "sha256": "329097689ce615f5cd56b17fcf21b8ead542624de88f400afbfb498ae40669cf",
+      "original_sha256": "0c372eb856ada8031df459e1059513047dd9128e63980f05928ead3759dbb580"
+    },
+    {
+      "file": "resolve_full_32bpp_scaled_cs.h",
+      "sha256": "c52490fdae7f064e41cd7d431b4a3ae242766cc74b16a2702b90056427ce9401",
+      "original_sha256": "602fb4bc7f572687edf0120e1392d08ccf67390475bee6e6104b33764cd7ea05"
+    },
+    {
+      "file": "resolve_full_64bpp_cs.h",
+      "sha256": "de5674c9bc28b2ddb6b68d182f2799e7d291ac6d7acb4195c40f08da6c19b817",
+      "original_sha256": "79b2c57c99d89d648bd6b783ae480d34eeab68df453e14621a86a86288f04bb2"
+    },
+    {
+      "file": "resolve_full_64bpp_scaled_cs.h",
+      "sha256": "64b0580fa5665ae2a12c7c591966a15ff946bea0d399bdd97b071be792dc3894",
+      "original_sha256": "1fe02773859e48288647dc1f2cfdffeaf5c280b56e7fcf2778a3653324430501"
+    },
+    {
+      "file": "resolve_full_8bpp_cs.h",
+      "sha256": "507600f3052de6145b439f1e3d32554d90a27c44fc54fbef9258bae45c72ffc3",
+      "original_sha256": "d8f08bf396b7b840f17116dfac5a1131f279268b417c2cf16b2d7a4063e6b54c"
+    },
+    {
+      "file": "resolve_full_8bpp_scaled_cs.h",
+      "sha256": "392a7f25e57b1ed3ece8388603f93228e1a96fccffb2f4af2e4be5173680cbc4",
+      "original_sha256": "5346c90dc0f85df74c754b485ac6746bccd21d2bdaf7f434db038445226a58fc"
+    }
+  ]
+}

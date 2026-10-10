@@ -11,3 +11,4 @@ tools/bin/
 out/
 __pycache__/
 *.keys
+.idea/

@@ -32,5 +32,6 @@
   "forwarder_sha256": "195851e29e2c9198060a7d8d20615156ae32e97413ccfebb7d25fa18e2ff7a06",
   "final_release_binary_device_check": "pending",
   "known_issue": "Brief building-material flicker/frame drops may persist at new-area transitions",
-  "publication": "prepared locally; no push/release performed"
+  "publication": "GitHub release v0.2.0",
+  "release_url": "https://github.com/penettrator/Mercenaries2-NX/releases/tag/v0.2.0"
 }

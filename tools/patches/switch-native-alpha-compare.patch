@@ -1,0 +1,36 @@
+--- a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -39,6 +39,10 @@
+     static constexpr uint64_t kFSINoDepthLateInterlock = uint64_t(1) << 49;
+     // Full depth/stencil tests retained; only pure, alpha-independent bodies.
+     static constexpr uint64_t kFSIFullDepthLateInterlock = uint64_t(1) << 50;
++    // Native host-RT opt-in; bits 51/52 belong to native VPOS scale.
++    // Zero keeps the existing dynamic alpha compare, including old cache keys.
++    static constexpr uint64_t kNativeAlphaCompare = uint64_t(1) << 53;
++    static constexpr uint32_t kNativeAlphaCompareShift = 54;
+ 
+     enum class DepthStencilMode : uint32_t {
+       kNoModifiers,
+--- a/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -490,9 +490,17 @@
+     // Alpha test.
+     // TODO(Triang3l): Check how alpha test works with NaN on Direct3D 9.
+     // Extract the comparison function (less, equal, greater bits).
+-    spv::Id alpha_test_function = builder_->createTriOp(
+-        spv::OpBitFieldUExtract, type_uint_, main_system_constant_flags_,
+-        builder_->makeUintConstant(kSysFlag_AlphaPassIfLess_Shift), builder_->makeUintConstant(3));
++    const uint64_t alpha_modification = GetSpirvShaderModification().value;
++    spv::Id alpha_test_function;
++    if (!edram_fragment_shader_interlock_ &&
++        (alpha_modification & Modification::kNativeAlphaCompare)) {
++      alpha_test_function = builder_->makeUintConstant(
++          uint32_t((alpha_modification >> Modification::kNativeAlphaCompareShift) & 7));
++    } else {
++      alpha_test_function = builder_->createTriOp(
++          spv::OpBitFieldUExtract, type_uint_, main_system_constant_flags_,
++          builder_->makeUintConstant(kSysFlag_AlphaPassIfLess_Shift), builder_->makeUintConstant(3));
++    }
+     // Check if the comparison function is not "always" - that should pass even
+     // for NaN likely, unlike "less, equal or greater".
+     SpirvBuilder::IfBuilder if_alpha_test_function_is_non_always(

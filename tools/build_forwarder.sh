@@ -3,6 +3,8 @@
 # Adapted from reference/masseffect-nx/tools/build_nsp.sh (Forwarder-Mod + hacBrewPack, pinned commits).
 # Usage: SWITCH_PROD_KEYS=/path/prod.keys tools/build_forwarder.sh <release.nro> <output-dir>
 # The icon and NACP are taken from the NRO (see HANDOFF B:135 for how the release NRO got them).
+# 2026-10-16: the process descriptor allows CPU cores 0-3 (Prototype 2 forwarder, WORKLOG #100): the game
+# may use the fourth core (cvars switch_*_core_mask). Launching through hbmenu (hold R) keeps cores 0-2.
 set -euo pipefail
 NRO="$1"; OUT="$2"
 KEYS="${SWITCH_PROD_KEYS:?set SWITCH_PROD_KEYS to your own prod.keys}"
@@ -56,9 +58,16 @@ for k in ("title_id", "title_id_range_min", "title_id_range_max"):
 for old, new in (("title_id", "program_id"), ("title_id_range_min", "program_id_range_min"),
                  ("title_id_range_max", "program_id_range_max")):
     j[new] = j[old]
+core_caps = 0
 for c in j["kernel_capabilities"]:
+    if c["type"] == "kernel_flags":
+        # Cores 0-3 (was 0-2): the fourth core for the game threads (Prototype 2 WORKLOG #100).
+        c["value"]["highest_cpu_id"] = 3
+        c["value"]["lowest_cpu_id"] = 0
+        core_caps += 1
     if c["type"] == "debug_flags":
         c["value"] = {"allow_debug": False, "force_debug": True, "force_debug_prod": False}
+assert core_caps == 1, "Expected one kernel_flags capability"
 j["address_space_type"] = 3  # 39-bit; type 1 is only 36 bits
 p.write_text(json.dumps(j, indent=2))
 src = root / "loader/source/main.c"
@@ -71,6 +80,28 @@ PY
     mkdir -p exefs
     elf2nso loader/hbl.elf exefs/main
     npdmtool loader/hbl.json exefs/main.npdm
+    python3 - <<"PY"
+import json, os, pathlib, struct
+p = pathlib.Path("exefs/main.npdm"); b = p.read_bytes()
+assert b[:4] == b"META"
+assert ((b[0xC] >> 1) & 7) == 3, "NPDM must use a 39-bit address space"
+checks = {}
+for label, off_pos, k_off, k_len in (("ACI0", 0x70, 0x30, 0x34), ("ACID", 0x78, 0x230, 0x234)):
+    start = struct.unpack_from("<I", b, off_pos)[0]
+    offset = struct.unpack_from("<I", b, start + k_off)[0]
+    size = struct.unpack_from("<I", b, start + k_len)[0]
+    flags = [v[0] for v in struct.iter_unpack("<I", b[start+offset:start+offset+size]) if (v[0] & 15) == 7]
+    assert len(flags) == 1
+    lo, hi = (flags[0] >> 16) & 255, (flags[0] >> 24) & 255
+    assert (lo, hi) == (0, 3), (label, lo, hi)
+    priorities = sorted(((flags[0] >> 4) & 63, (flags[0] >> 10) & 63))
+    # The SDK sets 0x2B (audio), 0x2C (presentation, ring, recorder) and 0x3B (guest threads).
+    assert priorities[0] <= 0x2B and 0x3B <= priorities[1], ("thread priorities outside the NPDM range", priorities)
+    checks[label] = {"lowest_cpu_id": lo, "highest_cpu_id": hi, "priority_range": priorities}
+checks.update(title_id=os.environ["TITLE_ID"], address_space_type=3, nro_path=os.environ["NRO_SD_PATH"])
+pathlib.Path("/output/forwarder-validation.json").write_text(json.dumps(checks, indent=2) + "\n")
+print(json.dumps(checks))
+PY
     cp packer/config.mk.template packer/config.mk
     make -C packer -j4 >/work/packer.log 2>&1 || { tail -30 /work/packer.log; exit 1; }
     # Packer output stays out of the console (it reads console keys).
@@ -82,4 +113,4 @@ PY
     mv "/output/$TITLE_ID.nsp" /output/Mercenaries2-forwarder.nsp
     chmod a+r /output/Mercenaries2-forwarder.nsp
   '
-echo "Built $OUT/Mercenaries2-forwarder.nsp (39-bit, title ID $TITLE_ID)"
+echo "Built $OUT/Mercenaries2-forwarder.nsp (39-bit, cores 0-3, title ID $TITLE_ID)"

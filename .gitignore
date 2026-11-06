@@ -12,3 +12,13 @@ out/
 __pycache__/
 *.keys
 .idea/
+
+# Local performance work and user-owned profiling/game artifacts
+perf_backup/
+perf_results/
+logs/
+*.gcda
+*.gcno
+*.profraw
+*.nro
+*.nsp

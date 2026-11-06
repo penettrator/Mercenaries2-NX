@@ -12,9 +12,11 @@
 // everything about EDRAM, fragment shader interlock and tessellation is gone.
 
 #include "native_renderer.h"
+#include "native_upload_fastpaths.h"
 #include "native_vk_extra.h"
 #include "native_shader_stats.h"
 #include "native_resolve_probe.h"
+#include "blocking_record_queue.h"
 #include <rex/thread.h>
 #include "native_tessellation.h"
 
@@ -72,6 +74,10 @@ extern "C" {
 
 // Texture-sign specialization constants, adapted from project8 SDK patch0015.
 // Universal rollback: false and restart. FSI SDK translators remain universal.
+REXCVAR_DECLARE(uint32_t, switch_host_core_mask);  // SDK xthread.cpp
+#if defined(__SWITCH__)
+extern "C" bool RexSwitchSetCurrentThreadMask(uint32_t mask, int spread);  // SDK threading_switch
+#endif
 REXCVAR_DEFINE_BOOL(gpu_specialize_texture_signs, false, "Mercs2",
                     "Specialize exact texture signedness/gamma at pipeline creation (restart required)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -405,6 +411,8 @@ struct RenderTarget {
   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t storage_height = 0;
+  bool attachment_only_depth = false;
   uint64_t last_used_frame = 0;
 };
 
@@ -461,8 +469,16 @@ struct VertexRangeKey {
   uint32_t address;
   uint32_t size;
   uint64_t hash;
+#if MERCENARIES2_DYNAMIC_UPLOAD_STAMPS
+  uint64_t epoch = 0;
+  bool fresh = false;
+#endif
   bool operator==(const VertexRangeKey& o) const {
-    return address == o.address && size == o.size && hash == o.hash;
+    return address == o.address && size == o.size && hash == o.hash
+#if MERCENARIES2_DYNAMIC_UPLOAD_STAMPS
+           && epoch == o.epoch && fresh == o.fresh
+#endif
+        ;
   }
 };
 struct VertexRangeKeyHasher {
@@ -737,6 +753,20 @@ struct Renderer::Impl {
   // 1x (1280 wide) and back every frame; with this both are one image with one layout.
   static constexpr uint64_t kVposScaleXBit = uint64_t(1) << 51;
   static constexpr uint64_t kVposScaleYBit = uint64_t(1) << 52;
+#if MERCENARIES2_ALPHA_COMPARE_SPECIALIZATION
+  // Shared by ring and prewarm. Lifetime-total, never re-credit a failed job;
+  // concurrent duplicate translations therefore consume budget conservatively.
+  static constexpr uint32_t kAlphaTranslationLimit = 64;
+  std::atomic<uint32_t> alpha_translations_reserved{0};
+  bool ReserveAlphaTranslation() {
+    uint32_t count = alpha_translations_reserved.load(std::memory_order_relaxed);
+    while (count < kAlphaTranslationLimit) {
+      if (alpha_translations_reserved.compare_exchange_weak(
+              count, count + 1, std::memory_order_relaxed)) return true;
+    }
+    return false;
+  }
+#endif
   // Translators by draw resolution scale for VPOS: [x2][y2].
   std::unique_ptr<SpirvShaderTranslator> scaled_translators[2][2];
   std::unique_ptr<SpirvShaderTranslator> scaled_worker_translators[2][2];
@@ -838,6 +868,9 @@ struct Renderer::Impl {
   FlatMap64<RangeCopy> vertex_ranges;
   static uint64_t RangeSlot(const VertexRangeKey& k) {
     uint64_t h = k.hash ^ ((uint64_t(k.address) << 32) | k.size);
+#if MERCENARIES2_DYNAMIC_UPLOAD_STAMPS
+    h ^= k.epoch * 0xD1B54A32D192ED03ull ^ (k.fresh ? 0xA340C195E812789Bull : 0);
+#endif
     h *= 0xBF58476D1CE4E5B9ull;
     h ^= h >> 31;
     return h == ~uint64_t(0) ? 0 : h;
@@ -877,6 +910,11 @@ struct Renderer::Impl {
     uint64_t content = 0;
     uint32_t changes = 0;
     ChangeDetector detector;
+#if MERCENARIES2_DYNAMIC_UPLOAD_STAMPS
+    DynamicUploadStamp dynamic;
+    uint64_t epoch = 0;
+    bool fresh = false;
+#endif
   };
   // This frame's hash of a vertex or index range. Data the game rewrites
   // every frame (skinned meshes, particles) was hashed in full every frame
@@ -887,6 +925,17 @@ struct Renderer::Impl {
   uint64_t RangeHash(VertexHash& known, const uint8_t* data, uint32_t bytes, uint32_t address) {
     if (known.frame == frame) return known.hash;
     known.frame = frame;
+#if MERCENARIES2_DYNAMIC_UPLOAD_STAMPS
+    const auto stamp = known.dynamic.Check(frame, exact_vertex_check, (address >> 4) ^ (address >> 12), [&] {
+      return exact_vertex_check ? known.detector.CheckExact(data, bytes, vertex_hash_bytes)
+                               : known.detector.Check(data, bytes, frame, address >> 4, vertex_hash_bytes);
+    });
+    known.hash = stamp.hash;
+    known.epoch = stamp.epoch;
+    known.fresh = stamp.fresh;
+    if (stamp.fresh) stats().dynamic_hash_bytes_skipped += bytes;
+    return known.hash;
+#else
     if (!exact_vertex_check && known.changes >= 4 && (frame & 15)) {
       known.hash = (frame + 1) * 0xD1B54A32D192ED03ull ^ (uint64_t(address) << 20) ^ bytes;
       return known.hash;
@@ -899,6 +948,7 @@ struct Renderer::Impl {
     known.content = content;
     known.hash = content;
     return content;
+#endif
   }
   uint64_t vertex_hash_bytes = 0;
   bool exact_vertex_check = true;
@@ -1205,6 +1255,32 @@ struct Renderer::Impl {
     if (d.flags & kDrawPipeline) {
       f.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
     }
+#if MERCENARIES2_DESCRIPTOR_BATCH
+    // Only adjacent changed sets may be grouped. Never bind a gap: unchanged
+    // sets and their dynamic offsets must keep exactly their previous values.
+    static_assert(SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram == 0 &&
+                  SpirvShaderTranslator::kDescriptorSetConstants == 1 &&
+                  SpirvShaderTranslator::kDescriptorSetTexturesVertex == 2 &&
+                  SpirvShaderTranslator::kDescriptorSetTexturesPixel == 3);
+    const uint32_t mask = (d.flags >> 1) & 15;
+    VkDescriptorSet sets[4] = {};
+    // DrawCommand deliberately leaves unused fields uninitialized.
+    if (mask & 1) sets[0] = d.set_shared;
+    if (mask & 2) sets[1] = d.set_constants;
+    if (mask & 4) sets[2] = d.texture_sets[0];
+    if (mask & 8) sets[3] = d.texture_sets[1];
+    for (uint32_t first = 0; first < 4;) {
+      if (!(mask & (1u << first))) { ++first; continue; }
+      uint32_t end = first + 1;
+      while (end < 4 && (mask & (1u << end))) ++end;
+      const bool constants = first <= 1 && end > 1;
+      f.vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout,
+          first, end - first, sets + first,
+          constants ? SpirvShaderTranslator::kConstantBufferCount : 0,
+          constants ? d.offsets : nullptr);
+      first = end;
+    }
+#else
     if (d.flags & kDrawSharedSet) {
       f.vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout,
                                 SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram, 1,
@@ -1226,6 +1302,7 @@ struct Renderer::Impl {
                                 SpirvShaderTranslator::kDescriptorSetTexturesPixel, 1,
                                 &d.texture_sets[1], 0, nullptr);
     }
+#endif
     if (d.flags & kDrawViewport) f.vkCmdSetViewport(c, 0, 1, &d.viewport);
     if (d.flags & kDrawScissor) f.vkCmdSetScissor(c, 0, 1, &d.scissor);
     if (d.flags & kDrawDepthBias) f.vkCmdSetDepthBias(c, d.bias_constant, 0.0f, d.bias_slope);
@@ -1252,53 +1329,31 @@ struct Renderer::Impl {
     }
   }
   static constexpr uint32_t kRecordQueueSize = 4096;
-  std::unique_ptr<DrawCommand[]> record_queue;
-  std::atomic<uint32_t> record_head{0};
-  std::atomic<uint32_t> record_tail{0};
-  std::atomic<bool> record_stop{false};
-  std::atomic<bool> record_sleeping{false};
-  std::mutex record_mutex;
-  std::condition_variable record_cv;
+  // 2026-10-16 (Prototype 2 WORKLOG #70/#71, hardware-tested): an event-driven queue. The old one
+  // spun (16 yields, then 2 ms timed waits; a full queue and DrainRecorder yielded in a loop) on cores
+  // the game's threads need: run79 had all three cores full. Work is woken in batches of 32 draws,
+  // by KickRecorder before the ring thread waits for the game, and by DrainRecorder.
+  BlockingRecordQueue<DrawCommand, kRecordQueueSize, 32> record_work;
   std::thread record_thread;
   bool record_threaded = false;
 
-  void WakeRecorder() {
-    if (record_sleeping.load(std::memory_order_seq_cst)) {
-      std::lock_guard<std::mutex> lock(record_mutex);
-      record_cv.notify_one();
-    }
-  }
+  void WakeRecorder() { record_work.WakeConsumer(); }
 
   void RecordThread() {
     rex::thread::set_current_thread_name("GPU record");
 #if defined(__SWITCH__)
     svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
-    // Off the ring thread's core.
-    svcSetThreadCoreMask(CUR_THREAD_HANDLE, 1, 0x3);
+    {
+      // switch_host_core_mask (cores of the host service threads) when set; before: cores 0-1.
+      const uint32_t host_mask = REXCVAR_GET(switch_host_core_mask) & 0xFu;
+      if (!host_mask || !RexSwitchSetCurrentThreadMask(host_mask, -1)) {
+        svcSetThreadCoreMask(CUR_THREAD_HANDLE, 1, 0x3);
+      }
+    }
 #endif
-    uint32_t idle = 0;
-    while (true) {
-      uint32_t tail = record_tail.load(std::memory_order_relaxed);
-      if (tail != record_head.load(std::memory_order_acquire)) {
-        ExecuteDrawCommand(record_queue[tail % kRecordQueueSize]);
-        record_tail.store(tail + 1, std::memory_order_release);
-        idle = 0;
-        continue;
-      }
-      if (record_stop.load(std::memory_order_acquire)) return;
-      // Briefly: spinning longer took cores from the game's own threads.
-      if (++idle < 16) {
-        std::this_thread::yield();
-        continue;
-      }
-      std::unique_lock<std::mutex> lock(record_mutex);
-      record_sleeping.store(true, std::memory_order_seq_cst);
-      if (record_head.load(std::memory_order_seq_cst) == tail &&
-          !record_stop.load(std::memory_order_acquire)) {
-        record_cv.wait_for(lock, std::chrono::milliseconds(2));
-      }
-      record_sleeping.store(false, std::memory_order_relaxed);
-      idle = 0;
+    while (const DrawCommand* draw = record_work.FrontOrWait()) {
+      ExecuteDrawCommand(*draw);
+      record_work.CompleteFront();
     }
   }
 
@@ -1307,39 +1362,23 @@ struct Renderer::Impl {
       ExecuteDrawCommand(d);
       return;
     }
-    uint32_t head = record_head.load(std::memory_order_relaxed);
-    while (head - record_tail.load(std::memory_order_acquire) >= kRecordQueueSize) {
-      WakeRecorder();
-      std::this_thread::yield();
+    if (!record_work.Push(d)) {
+      ExecuteDrawCommand(d);  // closed (shutdown): never lose a draw
     }
-    record_queue[head % kRecordQueueSize] = d;
-    record_head.store(head + 1, std::memory_order_seq_cst);
-    // In batches: the recording thread kept up draw by draw, slept between
-    // them, and waking it for every draw (a lock and a system call) showed as
-    // 6% of this thread in lock contention. It is also woken when this
-    // thread is about to wait for the game (KickRecorder), and anything
-    // recording into the command buffer drains the queue first.
-    if (head + 1 - record_tail.load(std::memory_order_relaxed) >= kRecordBatch) WakeRecorder();
   }
-  static constexpr uint32_t kRecordBatch = 32;
-
+  // In batches: the recording thread kept up draw by draw, slept between
+  // them, and waking it for every draw (a lock and a system call) showed as
+  // 6% of this thread in lock contention. It is also woken when this
+  // thread is about to wait for the game (KickRecorder), and anything
+  // recording into the command buffer drains the queue first.
   void KickRecorder() {
-    if (record_threaded &&
-        record_tail.load(std::memory_order_acquire) != record_head.load(std::memory_order_relaxed)) {
-      WakeRecorder();
-    }
+    if (record_threaded && record_work.Pending()) WakeRecorder();
   }
 
   void DrainRecorder() {
-    if (!record_threaded) return;
-    uint32_t head = record_head.load(std::memory_order_relaxed);
-    if (record_tail.load(std::memory_order_acquire) == head) return;
-    uint64_t start = NowNs();
-    uint32_t spins = 0;
-    while (record_tail.load(std::memory_order_acquire) != head) {
-      WakeRecorder();
-      if (++spins > 32) std::this_thread::yield();
-    }
+    if (!record_threaded || !record_work.Pending()) return;
+    const uint64_t start = NowNs();
+    record_work.Drain();
     frame_drain_wait_ns += NowNs() - start;
   }
   RendererStats& stats() { return owner->stats_; }
@@ -2142,7 +2181,6 @@ bool Renderer::Impl::Initialize() {
   }
   pipeline_thread = std::thread([this]() { PipelineThread(); });
   if (REXCVAR_GET(mercs2_native_record_thread)) {
-    record_queue = std::make_unique<DrawCommand[]>(kRecordQueueSize);
     record_thread = std::thread([this]() { RecordThread(); });
     record_threaded = true;
   }
@@ -2619,7 +2657,13 @@ void Renderer::Impl::ProfileReport() {
                         t.ns / 1e6 / frames, double(t.count) / frames, double(t.draws) / frames,
                         double(t.elements) / 1e3 / frames);
   }
+  // The combined diagnostic run keeps the user's warn-level logging. Emit
+  // only this existing sampled per-pass summary, without enabling draw spam.
+#if MERCENARIES2_DEPTH_ATTACHMENT_ONLY || MERCENARIES2_INDEX_UPLOAD_SPECIALIZATION || MERCENARIES2_DYNAMIC_UPLOAD_STAMPS || MERCENARIES2_TARGETED_MEMO
+  REXLOG_WARN("{}", line);
+#else
   REXLOG_INFO("{}", line);
+#endif
   profile_totals.clear();
   profiled_frames = 0;
   profiled_ns = 0;
@@ -2730,11 +2774,7 @@ void Renderer::Impl::Shutdown() {
   }
   if (record_thread.joinable()) {
     DrainRecorder();
-    record_stop.store(true, std::memory_order_release);
-    {
-      std::lock_guard<std::mutex> lock(record_mutex);
-      record_cv.notify_all();
-    }
+    record_work.Close();
     record_thread.join();
     record_threaded = false;
   }
@@ -4137,6 +4177,14 @@ void Renderer::Impl::PrewarmThread(std::vector<PrewarmShader> list_shaders,
   std::unique_ptr<SpirvShaderTranslator> scaled[2][2];
   uint32_t translated = 0, translate_failed = 0;
   auto translate = [&](VulkanShader* shader, uint64_t modification) -> VkShaderModule {
+    if (modification & SpirvShaderTranslator::Modification::kNativeAlphaCompare) {
+#if MERCENARIES2_ALPHA_COMPARE_SPECIALIZATION
+      if (!shader->GetTranslation(modification) && !ReserveAlphaTranslation()) return VK_NULL_HANDLE;
+#else
+      // An OFF build must not prewarm specialized variants saved by an ON build.
+      return VK_NULL_HANDLE;
+#endif
+    }
     if (!shader->is_ucode_analyzed()) shader->AnalyzeUcode(own_disasm);
     auto* translation =
         static_cast<VulkanShader::VulkanTranslation*>(shader->GetOrCreateTranslation(modification));
@@ -4508,11 +4556,46 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
     if (old->height >= min_height) {
       return old;
     }
+#if MERCENARIES2_DEPTH_ATTACHMENT_ONLY
+    if (old->attachment_only_depth && old->storage_height >= min_height) {
+      BeginRecording();
+      EndPass(PassEnd::TargetCreate);
+      DrainRecorder();
+      // Replace the old copy dependencies, not just the copy: LOAD must see
+      // prior depth writes and cannot race earlier uses of the same image.
+      VkMemoryBarrier dependency = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+          VK_ACCESS_MEMORY_WRITE_BIT,
+          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+      dfn().vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+          0, 1, &dependency, 0, nullptr, 0, nullptr);
+      old->height = rex::align(min_height, 16u);
+      ++rt_generation;
+      ++stats().depth_growth_reuses;
+      return old;
+    }
+#endif
   }
   auto rt = std::make_unique<RenderTarget>();
   rt->key = key;
   rt->width = std::max(key.pitch, 1u);
   rt->height = rex::align(min_height, 16u);
+  rt->storage_height = rt->height;
+  uint64_t depth_extra_bytes = 0;
+#if MERCENARIES2_DEPTH_ATTACHMENT_ONLY
+  // Never switch an existing transfer depth image to attachment-only on grow:
+  // preserving that image would require a forbidden transfer destination.
+  // Budget counts conservative extra storage, lifetime-total (no re-credit).
+  constexpr uint64_t kExtraDepthBudget = 64ull << 20;
+  if (key.is_depth && !old) {
+    depth_extra_bytes = uint64_t(rex::align(rt->width, 128u)) *
+                        (2048u - rt->height) * 16 * (1u << key.msaa);
+    if (depth_extra_bytes <= kExtraDepthBudget - stats().depth_extra_reserved_bytes) {
+      rt->attachment_only_depth = true;
+      rt->storage_height = 2048;
+    }
+  }
+#endif
   rt->samples = VkSampleCountFlagBits(1u << key.msaa);
   rt->format = key.is_depth ? DepthFormatFor(key.format)
                             : ColorFormatToVk(xenos::ColorRenderTargetFormat(key.format));
@@ -4521,7 +4604,7 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   info.imageType = VK_IMAGE_TYPE_2D;
   info.format = rt->format;
-  info.extent = {rt->width, rt->height, 1};
+  info.extent = {rt->width, rt->storage_height, 1};
   info.mipLevels = 1;
   info.arrayLayers = 1;
   info.samples = rt->samples;
@@ -4529,7 +4612,8 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   info.usage = (key.is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                                    VK_IMAGE_USAGE_SAMPLED_BIT
                              : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
-               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+               VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  if (!rt->attachment_only_depth) info.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!rex::ui::vulkan::util::CreateDedicatedAllocationImage(
           device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal, rt->image,
@@ -4567,16 +4651,37 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   VkImageMemoryBarrier barrier = {};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   barrier.srcAccessMask = 0;
-  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  const VkPipelineStageFlags init_stage = rt->attachment_only_depth
+      ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+      : VK_PIPELINE_STAGE_TRANSFER_BIT;
+  const VkAccessFlags init_access = rt->attachment_only_depth
+      ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = init_access;
   barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
   barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.image = rt->image;
   barrier.subresourceRange = view.subresourceRange;
-  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, init_stage,
                              0, 0, nullptr, 0, nullptr, 1, &barrier);
-  if (key.is_depth) {
+  if (rt->attachment_only_depth) {
+    VkRenderingAttachmentInfo depth = {};
+    depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depth.imageView = rt->view;
+    depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.clearValue.depthStencil = {1.0f, 0};
+    VkRenderingInfo rendering = {};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.extent = {rt->width, rt->storage_height};
+    rendering.layerCount = 1;
+    rendering.pDepthAttachment = &depth;
+    rendering.pStencilAttachment = HasStencil(rt->format) ? &depth : nullptr;
+    dfn().vkCmdBeginRendering(c, &rendering);
+    dfn().vkCmdEndRendering(c);
+  } else if (key.is_depth) {
     VkClearDepthStencilValue clear = {1.0f, 0};
     vkCmdClearDepthStencilImage(c, rt->image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                                       &view.subresourceRange);
@@ -4606,12 +4711,12 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
         {frame, old->image, old->view, old->sample_view, old->stencil_view, old->memory});
   }
   VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                           VK_ACCESS_TRANSFER_WRITE_BIT,
+                           init_access,
                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
-  dfn().vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+  dfn().vkCmdPipelineBarrier(cmd(), init_stage,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
@@ -4620,6 +4725,13 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   render_targets[key] = std::move(rt);
   ++stats().render_targets_created;
   ++rt_generation;
+  if (result->attachment_only_depth) {
+    stats().depth_extra_reserved_bytes += depth_extra_bytes;
+    ++stats().depth_attachment_images;
+    REXLOG_WARN("PERF: depth attachment-only {}x{} storage_rows={} extra_budget={} "
+                "transfer_dst=0", result->width, result->height, result->storage_height,
+                stats().depth_extra_reserved_bytes);
+  }
   REXLOG_INFO("[native] Render target {}x{} {} format {} at tile {}, {}x MSAA", result->width,
               result->height, key.is_depth ? "depth" : "color", key.format, key.base_tiles,
               1u << key.msaa);
@@ -5238,6 +5350,23 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
     if (SampleScaleX(surface_info.msaa_samples) > 1) ps_mod.value |= kVposScaleXBit;
     if (SampleScaleY(surface_info.msaa_samples) > 1) ps_mod.value |= kVposScaleYBit;
   }
+#if MERCENARIES2_ALPHA_COMPARE_SPECIALIZATION
+  // Final key includes VPOS bits before looking for an existing translation.
+  // EarlyHint already omits alpha tests; avoid redundant variants there/without RT0.
+  if (ps && ps->writes_color_target(0) && ps_mod.pixel.depth_stencil_mode !=
+      SpirvShaderTranslator::Modification::DepthStencilMode::kEarlyHint) {
+    const auto control = r.Get<reg::RB_COLORCONTROL>();
+    const auto compare = control.alpha_test_enable ? control.alpha_func
+                                                   : xenos::CompareFunction::kAlways;
+    const uint64_t specialized = ps_mod.value |
+        SpirvShaderTranslator::Modification::kNativeAlphaCompare |
+        (uint64_t(compare) << SpirvShaderTranslator::Modification::kNativeAlphaCompareShift);
+    if (ps->GetTranslation(specialized) || ReserveAlphaTranslation()) {
+      ps_mod.value = specialized;
+      ++stats().alpha_specialized_draws;
+    }
+  }
+#endif
   auto* vs_translation =
       static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
   auto* ps_translation =
@@ -5744,6 +5873,10 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       index_key = {dma_base, bytes | 0x80000000u,
                    known.hash ^ (uint64_t(index_endian) << 60) ^
                        (reset_enabled ? (uint64_t(reset_index) << 8) | 1 : 0)};
+#if MERCENARIES2_DYNAMIC_UPLOAD_STAMPS
+      index_key.epoch = known.epoch;
+      index_key.fresh = known.fresh;
+#endif
       uint64_t found = FindRange(index_key);
       if (found != UINT64_MAX && stream_head - found < kStreamSize / 2) {
         index_offset = VkDeviceSize(found % kStreamSize);
@@ -5771,6 +5904,15 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
           std::memcpy(out + size_t(i) * 2, &h, 2);
         }
       };
+#if MERCENARIES2_INDEX_UPLOAD_SPECIALIZATION
+      static_assert(uint32_t(xenos::Endian::kNone) == 0 && uint32_t(xenos::Endian::k8in16) == 1 &&
+                    uint32_t(xenos::Endian::k8in32) == 2 && uint32_t(xenos::Endian::k16in32) == 3);
+      if (indexed && !convert_fan && !convert_loop && index_size == (index32 ? 4u : 2u) &&
+          TryUploadIndices(guest_indices, out, draw_count, index_size, uint32_t(index_endian),
+                           reset_enabled, reset_index)) {
+        stats().index_upload_fast_bytes += uint64_t(draw_count) * index_size;
+      } else
+#endif
       if (convert_fan) {
         uint32_t first = read_index(0);
         for (uint32_t t = 0; t + 2 < guest_count; ++t) {
@@ -5846,6 +5988,10 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       VertexHash& known = vertex_hashes[(uint64_t(address) << 32) | bytes];
       RangeHash(known, source, bytes, address);
       VertexRangeKey range_key = {address, bytes, known.hash};
+#if MERCENARIES2_DYNAMIC_UPLOAD_STAMPS
+      range_key.epoch = known.epoch;
+      range_key.fresh = known.fresh;
+#endif
       uint64_t found = FindRange(range_key);
       VkDeviceSize range_offset;
       if (found != UINT64_MAX && stream_head - found < kStreamSize / 2) {
@@ -5865,7 +6011,16 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     vertex_ranges.clear();
   }
   if (vertex_hashes.size() > 65536) {
-    vertex_hashes.clear();
+    // 2026-10-16 (Prototype 2 WORKLOG #97/#103): dropping everything every few seconds (ranges in
+    // per-frame dynamic allocations add ~1000 keys a frame) reset every range's change history, so
+    // the sampled/unique-hash shortcuts restarted from zero. Keep what was used in the last frames.
+    const uint64_t now_frame = frame;
+    vertex_hashes.retain([now_frame](const VertexHash& v) {
+      if (v.frame == UINT64_MAX || v.frame + 16 < now_frame) return false;
+      return v.frame + 2 >= now_frame || v.changes > 0 || v.detector.unchanged() > 0 ||
+             v.detector.changes() > 0;
+    });
+    if (vertex_hashes.size() > 49152) vertex_hashes.clear();
   }
   VkDeviceSize fetch_offset;
   if (last_fetch.submission == submission_number &&
@@ -6313,6 +6468,16 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       ProfileMark((kProfileDraw << 60) | ((vs_hash & 0x3FFFFFFF) << 30) | (ps_hash & 0x3FFFFFFF));
     }
   }
+#if MERCENARIES2_FRAME_CSV
+    const uint32_t mask = (d.flags >> 1) & 15;
+    const uint32_t old_calls = uint32_t(__builtin_popcount(mask));
+    stats().descriptor_bind_calls_unbatched += old_calls;
+#if MERCENARIES2_DESCRIPTOR_BATCH
+    stats().descriptor_bind_calls += uint32_t(__builtin_popcount(mask & ~(mask << 1)));
+#else
+    stats().descriptor_bind_calls += old_calls;
+#endif
+#endif
   SubmitDraw(d);
   ProfileDraw(d.count);
   ++frame_draw_count;
@@ -7136,6 +7301,8 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
   stats().textures_streamed = textures.stats().streamed;
   stats().textures_pending = textures.stats().pending;
   stats().textures_replaced = textures.stats().replaced;
+  stats().memo_entries_dropped = textures.stats().memo_entries_dropped;
+  stats().memo_entries_kept = textures.stats().memo_entries_kept;
   stats().frame_upload_wait_ns = frame_upload_wait_ns;
   stats().frame_fence_wait_ns = frame_fence_wait_ns;
   stats().frame_drain_wait_ns = frame_drain_wait_ns;
@@ -7581,7 +7748,9 @@ struct CpuTimer {
 }  // namespace
 
 void Renderer::Draw(const uint32_t* immediate_indices, uint32_t immediate_index_words) {
+#if !MERCENARIES2_LEAN_DRAW_TIMERS
   CpuTimer timer(stats_.cpu_ns);
+#endif
   impl_->Draw(immediate_indices, immediate_index_words);
 }
 
@@ -7599,5 +7768,5 @@ void Renderer::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, uint32_
 void Renderer::SetGammaRamp256(const uint32_t* entries) {
   std::memcpy(impl_->gamma_ramp, entries, sizeof(impl_->gamma_ramp));
 }
-
+#include "native_prewarm_extension.inc"
 }  // namespace mercs2::native

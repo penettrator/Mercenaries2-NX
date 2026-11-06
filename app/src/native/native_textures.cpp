@@ -7,8 +7,12 @@
 // layout has no cost.
 
 #include "native_textures.h"
+#include "native_upload_fastpaths.h"
 #include "native_vk_extra.h"
 #include "native_hash.h"
+#include "native_image_reuse.h"
+#include "native_retention_policy.h"
+#include "native_staging_reuse.h"
 
 #include <algorithm>
 #include <atomic>
@@ -480,9 +484,16 @@ struct StreamJob {
   VkBuffer staging_buffer = VK_NULL_HANDLE;
   VkDeviceMemory staging_memory = VK_NULL_HANDLE;
   VkDeviceSize staging_size = 0;
+  void* staging_mapping = nullptr;
+  uint64_t staging_capacity = 0;
+  VkDeviceSize staging_bytes = 0;
   std::atomic<bool> done{false};
   bool ok = false;
 };
+
+REXCVAR_DEFINE_UINT32(mercs2_native_staging_pool_mb, 0, "Mercs2",
+                      "Idle GPU-complete upload staging cache MiB (0 = original allocation path, max16)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_DOUBLE(mercs2_native_texture_lod_bias, 0.0, "Mercs2",
                       "Added to every texture's mip level choice (negative = sharper). Rendering at "
@@ -515,6 +526,9 @@ REXCVAR_DEFINE_BOOL(mercs2_native_texture_pool, false, "Mercs2",
                     "HANDOFF B:131: guest textures share 64 MB device memory blocks instead of one "
                     "allocation each (an allocation is several kernel round trips, ~3 ms per new "
                     "texture in explosions); restart required");
+REXCVAR_DEFINE_BOOL(mercs2_native_null_texture_probe, false, "Mercs2",
+                    "Diagnostic only: mark pending 2D stream lookups magenta, alpha unchanged; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_UINT32(mercs2_native_sync_texture_frame_kb, 0, "Mercs2",
                       "Per-frame budget (KB) of new textures made on the spot; 0 = creates x size");
 
@@ -541,6 +555,7 @@ struct TextureCache::Texture {
   uint64_t last_used_submission = 0;
   uint64_t key_hash = 0;
   uint64_t content_hash = 0;
+  uint64_t payload_bytes = 0;
   // Still being created by the streaming worker.
   std::shared_ptr<StreamJob> stream;
   uint32_t level_count = 0;
@@ -595,6 +610,9 @@ struct TextureCache::Impl {
     // Reused through this frame: the content checks would not look at the
     // texture's data before then (see ChangeDetector::TrustedUntil).
     uint64_t valid_until;
+#if MERCENARIES2_TARGETED_MEMO
+    uint32_t resolve_address = UINT32_MAX;
+#endif
   };
   // Set by GetViewUncached for the memo.
   uint64_t last_valid_until = 0;
@@ -614,9 +632,9 @@ struct TextureCache::Impl {
 
   std::unordered_map<uint32_t, VkSampler> samplers;
 
-  VkImage null_images[3] = {};
-  VkDeviceMemory null_memory[3] = {};
-  VkImageView null_views[3] = {};  // 2D array, cube, 3D
+  VkImage null_images[4] = {};
+  VkDeviceMemory null_memory[4] = {};
+  VkImageView null_views[4] = {};  // 2D array, cube, 3D
 
   // Destroyed once the frame that last used them is complete.
   struct Retired {
@@ -699,17 +717,8 @@ struct TextureCache::Impl {
         stream_jobs.pop_front();
       }
       job->ok = CreateTextureImage(job->info, job->image, job->memory);
-      if (job->ok) {
-        job->ok = rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            device, job->staging_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            rex::ui::vulkan::util::MemoryPurpose::kUpload, job->staging_buffer,
-            job->staging_memory);
-      }
-      void* mapping = nullptr;
-      if (job->ok && device->functions().vkMapMemory(device->device(), job->staging_memory, 0,
-                                                     VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) {
-        job->ok = false;
-      }
+      if (job->ok) job->ok = AcquireStreamStaging(*job);
+      void* mapping = job->staging_mapping;
       if (job->ok) {
         job->untile.staging = static_cast<uint8_t*>(mapping);
         RunUntile(job->untile);
@@ -718,13 +727,70 @@ struct TextureCache::Impl {
     }
   }
 
-  void DestroyStreamJob(StreamJob& job) {
+  struct StagingBlock {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapping = nullptr;
+    uint64_t capacity = 0;
+    uint64_t bytes = 0;
+  };
+  std::mutex staging_pool_mutex;
+  StagingReusePool<StagingBlock> staging_pool;
+  uint64_t staging_pool_budget = 0;
+  bool staging_pool_stopping = false;
+  std::atomic<uint64_t> staging_created{0}, staging_reused{0}, staging_returned{0};
+
+  bool AcquireStreamStaging(StreamJob& job) {
+    StagingBlock block;
+    if (staging_pool_budget) {
+      std::lock_guard<std::mutex> lock(staging_pool_mutex);
+      if (staging_pool.Take(job.staging_size, block)) {
+        job.staging_buffer = block.buffer;
+        job.staging_memory = block.memory;
+        job.staging_mapping = block.mapping;
+        job.staging_capacity = block.capacity;
+        job.staging_bytes = block.bytes;
+        staging_reused.fetch_add(1, std::memory_order_relaxed);
+        return true;
+      }
+    }
+    job.staging_capacity = StagingBucketSize(job.staging_size, staging_pool_budget);
+    if (!rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            device, job.staging_capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            rex::ui::vulkan::util::MemoryPurpose::kUpload, job.staging_buffer,
+            job.staging_memory, nullptr, &job.staging_bytes)) return false;
+    if (device->functions().vkMapMemory(device->device(), job.staging_memory, 0,
+        VK_WHOLE_SIZE, 0, &job.staging_mapping) != VK_SUCCESS) return false;
+    staging_created.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  void DestroyStagingBlock(const StagingBlock& block) {
     const auto& dfn = device->functions();
     VkDevice d = device->device();
-    if (job.staging_buffer) dfn.vkDestroyBuffer(d, job.staging_buffer, nullptr);
-    if (job.staging_memory) dfn.vkFreeMemory(d, job.staging_memory, nullptr);
+    if (block.mapping) dfn.vkUnmapMemory(d, block.memory);
+    if (block.buffer) dfn.vkDestroyBuffer(d, block.buffer, nullptr);
+    if (block.memory) dfn.vkFreeMemory(d, block.memory, nullptr);
+  }
+
+  // Existing callers guarantee GPU completion, an unsubmitted failure/orphan,
+  // or outer renderer device-idle. CPU untile completion alone is insufficient.
+  void DestroyStreamJob(StreamJob& job) {
+    StagingBlock block{job.staging_buffer, job.staging_memory, job.staging_mapping,
+                       job.staging_capacity, job.staging_bytes};
     job.staging_buffer = VK_NULL_HANDLE;
     job.staging_memory = VK_NULL_HANDLE;
+    job.staging_mapping = nullptr;
+    job.staging_capacity = job.staging_bytes = 0;
+    job.untile.staging = nullptr;
+    if (block.mapping && block.capacity <= (4u << 20) && staging_pool_budget) {
+      std::lock_guard<std::mutex> lock(staging_pool_mutex);
+      if (!staging_pool_stopping && staging_pool.Put(block, staging_pool_budget)) {
+        staging_returned.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+    DestroyStagingBlock(block);
   }
 
   struct RetiredStaging {
@@ -754,6 +820,10 @@ struct TextureCache::Impl {
   // device-local blocks. A pooled image keeps memory == VK_NULL_HANDLE; its range is found by
   // the image handle and returned before the image is destroyed (so a reused handle never
   // meets a stale entry).
+  bool null_texture_probe = false;
+  ImageReuse image_reuse;
+  uint64_t ready_count_bypass = 0;
+  uint64_t material_payload_bytes = 0, material_evictions = 0, material_reaped_streams = 0;
   bool texture_pool = false;
   static constexpr VkDeviceSize kPoolBlockSize = VkDeviceSize(64) << 20;
   struct PoolBlock {
@@ -803,6 +873,13 @@ struct TextureCache::Impl {
   }
 
   bool CreateTextureImage(const VkImageCreateInfo& info, VkImage& image, VkDeviceMemory& memory) {
+#if MERCENARIES2_IMAGE_REUSE
+    if (texture_pool) {
+      if (VkImage cached = image_reuse.Take(info)) {
+        image = cached; memory = VK_NULL_HANDLE; return true;
+      }
+    }
+#endif
     using rex::ui::vulkan::util::MemoryPurpose;
     if (!texture_pool) {
       return rex::ui::vulkan::util::CreateDedicatedAllocationImage(
@@ -856,12 +933,18 @@ struct TextureCache::Impl {
       return false;
     }
     pool_owned[uint64_t(reinterpret_cast<uintptr_t>(created))] = {block, offset, req.size};
+#if MERCENARIES2_IMAGE_REUSE
+    image_reuse.Remember(created, info, req.size);
+#endif
     image = created;
     memory = VK_NULL_HANDLE;
     return true;
   }
 
   void PoolRelease(VkImage image) {
+#if MERCENARIES2_IMAGE_REUSE
+    image_reuse.Forget(image);
+#endif
     if (!texture_pool || !image) return;
     std::lock_guard<std::mutex> lock(pool_mutex);
     auto it = pool_owned.find(uint64_t(reinterpret_cast<uintptr_t>(image)));
@@ -923,6 +1006,17 @@ struct TextureCache::Impl {
   std::unordered_map<uint32_t, bool> attachment_capable;
   // Bumped whenever the memo is dropped: an answer for some fetch changed.
   uint64_t answers_epoch = 1;
+
+  void ForgetResolveAnswers(uint32_t address, TextureCacheStats& stats) {
+    static_assert(TextureCache::kDepthWordsTag == 1);
+#if MERCENARIES2_TARGETED_MEMO
+    InvalidateResolveMemo(memo, address, stats.memo_entries_dropped, stats.memo_entries_kept);
+#else
+    (void)address; (void)stats;
+    memo.clear();
+#endif
+    ++answers_epoch;
+  }
   uint64_t next_view_id = 1;
   void ForgetViews(const std::vector<VkImageView>& views) {
     for (VkImageView v : views) {
@@ -936,10 +1030,16 @@ struct TextureCache::Impl {
       ++views_epoch;
       ForgetViews(views);
     }
-    Reap([this, image, memory, views = std::move(views)]() {
+    const uint64_t reusable_frame = frame;
+    Reap([this, image, memory, reusable_frame, views = std::move(views)]() {
       const auto& dfn = device->functions();
       VkDevice d = device->device();
       for (VkImageView v : views) dfn.vkDestroyImageView(d, v, nullptr);
+#if MERCENARIES2_IMAGE_REUSE
+      // DestroyLater is reached only after the resource's GPU frame completed.
+      // The old views were invalidated on the ring and are now destroyed.
+      if (image && !memory && image_reuse.RetainCompleted(image, reusable_frame)) return;
+#endif
       PoolRelease(image);
       if (image) dfn.vkDestroyImage(d, image, nullptr);
       if (memory) dfn.vkFreeMemory(d, memory, nullptr);
@@ -977,6 +1077,9 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
   im.device = device;
   im.memory = memory;
   im.texture_pool = REXCVAR_GET(mercs2_native_texture_pool);
+  im.staging_pool_budget = uint64_t(std::min(REXCVAR_GET(mercs2_native_staging_pool_mb), 16u)) << 20;
+  im.staging_pool_stopping = false;
+  im.null_texture_probe = REXCVAR_GET(mercs2_native_null_texture_probe);
   REXLOG_INFO("[native] texture memory pool {}", im.texture_pool);
   im.max_anisotropy =
       device->properties().samplerAnisotropy
@@ -1000,7 +1103,7 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
 
   const auto& dfn = device->functions();
   VkDevice d = device->device();
-  for (uint32_t i = 0; i < 3; ++i) {
+  for (uint32_t i = 0; i < (im.null_texture_probe ? 4u : 3u); ++i) {
     VkImageCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     info.imageType = i == 2 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
@@ -1022,7 +1125,7 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
     VkImageViewCreateInfo view = {};
     view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view.image = im.null_images[i];
-    view.viewType = i == 0 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+    view.viewType = (i == 0 || i == 3) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                            : (i == 1 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_3D);
     view.format = info.format;
     view.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
@@ -1036,7 +1139,9 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
 void TextureCache::InitializeNullImages(VkCommandBuffer commands) {
   Impl& im = *impl_;
   const auto& dfn = im.device->functions();
-  for (uint32_t i = 0; i < 3; ++i) {
+  const bool probe = im.null_texture_probe;
+  if (probe) REXLOG_WARN("DIAG: pending-stream 2D probe RGB=1,0,1 alpha=0; normal empty slots unchanged");
+  for (uint32_t i = 0; i < (probe ? 4u : 3u); ++i) {
     VkImageMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.srcAccessMask = 0;
@@ -1051,6 +1156,10 @@ void TextureCache::InitializeNullImages(VkCommandBuffer commands) {
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                              &barrier);
     VkClearColorValue black = {};
+    if (probe && i == 3) {
+      black.float32[0] = 1.0f;
+      black.float32[2] = 1.0f;
+    }
     VkImageSubresourceRange range = rex::ui::vulkan::util::InitializeSubresourceRange();
     dfn.vkCmdClearColorImage(commands, im.null_images[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                              &black, 1, &range);
@@ -1096,12 +1205,19 @@ void TextureCache::Shutdown() {
     im.reap_cv.notify_all();
     im.reap_thread.join();  // runs what is still queued first
   }
+  im.staging_pool_stopping = true;
+  im.staging_pool.Clear([&im](const auto& block) { im.DestroyStagingBlock(block); });
   for (auto& retired : im.retired_staging) {
     im.DestroyStreamJob(*retired.job);
   }
   im.retired_staging.clear();
   const auto& dfn = im.device->functions();
   VkDevice d = im.device->device();
+#if MERCENARIES2_IMAGE_REUSE
+  for (VkImage image : im.image_reuse.Expire(0, true)) {
+    im.PoolRelease(image); dfn.vkDestroyImage(d, image, nullptr);
+  }
+#endif
   for (auto& r : im.retired) {
     im.DestroyNow(r.image, r.memory, r.views);
   }
@@ -1134,7 +1250,7 @@ void TextureCache::Shutdown() {
     dfn.vkDestroySampler(d, s, nullptr);
   }
   im.samplers.clear();
-  for (uint32_t i = 0; i < 3; ++i) {
+  for (uint32_t i = 0; i < 4; ++i) {
     im.DestroyNow(im.null_images[i], im.null_memory[i],
                   im.null_views[i] ? std::vector<VkImageView>{im.null_views[i]}
                                    : std::vector<VkImageView>{});
@@ -1142,6 +1258,16 @@ void TextureCache::Shutdown() {
     im.null_memory[i] = VK_NULL_HANDLE;
     im.null_views[i] = VK_NULL_HANDLE;
   }
+#if MERCENARIES2_IMAGE_REUSE
+  // All producers/reaper have joined; Renderer::Shutdown already waited idle.
+  // Do not release memory if any image owner unexpectedly survived cleanup.
+  if (im.pool_owned.empty()) {
+    for (const auto& block : im.pool_blocks) dfn.vkFreeMemory(d, block.memory, nullptr);
+    im.pool_blocks.clear();
+  } else {
+    REXLOG_ERROR("[native] texture pool shutdown has {} live owners", im.pool_owned.size());
+  }
+#endif
   im.device = nullptr;
 }
 
@@ -1171,8 +1297,60 @@ void TextureCache::BeginFrame(uint64_t frame, uint64_t completed_frame) {
   }
   // Evict textures unused for about 20 seconds; the old content of changing
   // textures (a video, a render-to-texture the CPU fills) is what this frees.
-  constexpr uint64_t kEvictFrames = 600;
+  [[maybe_unused]] constexpr uint64_t kEvictFrames = 600;
   if (frame % 60 == 0) {
+#if MERCENARIES2_MATERIAL_RETENTION
+    // A retention target for idle host payload, not a hard GPU-memory cap.
+    // Recent/pending images and in-flight retirement remain protected.
+    constexpr uint64_t kMaterialBudget = uint64_t(128) << 20;
+    uint64_t payload = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> candidates;
+    std::unordered_set<const void*> evicted;
+    for (auto t = im.textures.begin(); t != im.textures.end();) {
+      Texture& texture = *t->second;
+      payload += texture.payload_bytes;
+      if (texture.stream && DiscardUnusedMaterialStream(frame, texture.last_used_frame,
+            texture.stream->done.load(std::memory_order_acquire), bool(texture.image), !texture.views.empty())) {
+        // Never promoted: no GPU submission can reference the job image/staging.
+        // done(acquire) also guarantees that the worker has finished touching it.
+        auto job = texture.stream;  // retain ownership until the existing reaper runs
+        evicted.insert(&texture);
+        im.Reap([&im, job]() {
+          im.DestroyStreamJob(*job);
+          if (job->image) im.DestroyNow(job->image, job->memory, {});
+        });
+        payload -= texture.payload_bytes;
+        t = im.textures.erase(t);
+        ++im.material_reaped_streams;
+        continue;
+      }
+      if (IdleMaterialExpired(frame, texture.last_used_frame, bool(texture.stream)))
+        candidates.emplace_back(texture.last_used_frame, t->first);
+      ++t;
+    }
+    std::sort(candidates.begin(), candidates.end());
+    for (const auto& [last_used, key] : candidates) {
+      (void)last_used;
+      if (payload <= kMaterialBudget) break;
+      auto t = im.textures.find(key);
+      Texture& texture = *t->second;
+      std::vector<VkImageView> views;
+      for (auto& [k, v] : texture.views) views.push_back(v);
+      evicted.insert(&texture);
+      im.ForgetViews(views);
+      im.Retire(texture.image, texture.memory, std::move(views), texture.last_used_frame);
+      payload -= texture.payload_bytes;
+      im.textures.erase(t);
+    }
+    im.material_payload_bytes = payload;
+    im.material_evictions += evicted.size();
+    if (!evicted.empty()) {
+      ++im.views_epoch; ++im.answers_epoch;
+      im.memo.for_each_value([&](Impl::Memo& memo) { InvalidateRetiredMaterial(memo, evicted); });
+      if (evicted.count(im.out_texture)) im.out_texture = nullptr;
+      if (evicted.count(im.last_texture)) im.last_texture = nullptr;
+    }
+#else
     for (auto t = im.textures.begin(); t != im.textures.end();) {
       Texture& texture = *t->second;
       if (texture.stream) {
@@ -1188,9 +1366,35 @@ void TextureCache::BeginFrame(uint64_t frame, uint64_t completed_frame) {
         ++t;
       }
     }
+#endif
     if (im.checked.size() > 16384) {
       im.checked.clear();
     }
+  }
+#if MERCENARIES2_IMAGE_REUSE
+  for (VkImage image : im.image_reuse.Expire(frame)) {
+    im.PoolRelease(image);
+    im.device->functions().vkDestroyImage(im.device->device(), image, nullptr);
+  }
+  if (frame % 300 == 0) {
+    const auto r = im.image_reuse.stats();
+    REXLOG_WARN("PERF: image reuse hits={} misses={} retained={} rejected={} idle={} bytes={}",
+                r.hits, r.misses, r.retained, r.rejected, r.idle, r.bytes);
+    REXLOG_WARN("PERF: texture ready mode={} pending={} streamed={} uploads={} extra_sync={}",
+                MERCENARIES2_READY_TEXTURES, stats_.pending, stats_.streamed, stats_.uploads, im.ready_count_bypass);
+  }
+#endif
+#if MERCENARIES2_MATERIAL_RETENTION
+  if (frame % 300 == 0) {
+    REXLOG_WARN("PERF: material retention payload={} budget={} evicted={} live={} reaped_streams={}",
+                im.material_payload_bytes, uint64_t(128) << 20, im.material_evictions, im.textures.size(), im.material_reaped_streams);
+  }
+#endif
+  if (im.staging_pool_budget && frame % 300 == 0) {
+    std::lock_guard<std::mutex> lock(im.staging_pool_mutex);
+    REXLOG_WARN("PERF: staging reuse created={} reused={} returned={} idle={} bytes={} budget={}",
+                im.staging_created.load(), im.staging_reused.load(), im.staging_returned.load(),
+                im.staging_pool.size(), im.staging_pool.bytes(), im.staging_pool_budget);
   }
   stats_.live_textures = im.textures.size();
 }
@@ -1228,7 +1432,7 @@ VkImageView TextureCache::GetResolveDestinationView2D(uint32_t address, uint32_t
   return result;
 }
 
-uint64_t TextureCache::views_epoch() const { return impl_->views_epoch; }
+uint64_t TextureCache::views_epoch() const { return impl_->views_epoch + MERCENARIES2_SLOT_SOURCE_EPOCH * impl_->answers_epoch; }
 
 uint64_t TextureCache::ViewId(VkImageView view) {
   Impl& im = *impl_;
@@ -1404,13 +1608,11 @@ ResolveDestination* TextureCache::GetResolveDestination(uint32_t address, uint32
       im.Retire(sized->image, sized->memory, std::move(sized_views), im.frame);
     }
     im.resolve_destinations.erase(it);
-    im.memo.clear();
-    ++im.answers_epoch;
+    im.ForgetResolveAnswers(address, stats_);
   }
 
   // Fetches of this address that were answered from memory must now find it.
-  im.memo.clear();
-  ++im.answers_epoch;
+  im.ForgetResolveAnswers(address, stats_);
   auto dest = std::make_unique<ResolveDestination>();
   dest->address = address;
   dest->width = width;
@@ -1510,6 +1712,12 @@ VkImageView TextureCache::GetView(const xenos::xe_gpu_texture_fetch_t& fetch,
   // GetViewUncached may have cleared the memo (a texture was replaced).
   im.memo[memo_key] = Impl::Memo{im.frame, result_view, im.last_texture,
                                  im.last_texture ? im.last_valid_until : im.frame};
+#if MERCENARIES2_TARGETED_MEMO
+  uint32_t w, h, d, base_page, mip_page, mip_max;
+  texture_util::GetSubresourcesFromFetchConstant(fetch, &w, &h, &d, &base_page, &mip_page,
+                                                 nullptr, &mip_max);
+  im.memo[memo_key].resolve_address = base_page << 12;
+#endif
   im.out_texture = im.last_texture;
   im.out_valid_until = im.last_texture ? im.last_valid_until : im.frame;
   return result_view;
@@ -1732,6 +1940,9 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
 
   // The content, hashed at most once per frame for each layout.
   Impl::Checked& checked = im.checked[key_hash];
+#if MERCENARIES2_MATERIAL_RETENTION
+  RevalidateInactiveMaterial(im.frame, checked);
+#endif
   uint64_t texture_hash;
   if (checked.frame == im.frame) {
     texture_hash = checked.texture_hash;
@@ -1758,11 +1969,14 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
   auto existing = im.textures.find(key_hash);
   if (existing != im.textures.end() && existing->second->stream) {
     Texture& pending = *existing->second;
+#if MERCENARIES2_MATERIAL_RETENTION
+    pending.last_used_frame = im.frame;  // last request, even while its worker is pending
+#endif
     StreamJob& job = *pending.stream;
     if (!job.done.load(std::memory_order_acquire)) {
       // Still streaming in: drawn without it for now.
       ++stats_.pending;
-      return null_view;
+      return (im.null_texture_probe && null_view == im.null_views[0]) ? im.null_views[3] : null_view;
     }
     if (!job.ok) {
       im.DestroyStreamJob(job);
@@ -1879,9 +2093,13 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     // an area coming into view does not freeze a frame on hundreds of image
     // allocations (each a kernel round trip). They appear a frame or two
     // later.
-    if (!reuse_image && !force_upload_now && im.sync_creates_left &&
+    // Demand readiness can bypass the image-count cap, never the existing
+    // byte budgets. This also preserves Allocate's per-draw ring guarantees.
+    if (!reuse_image && !force_upload_now &&
+        (im.sync_creates_left || MERCENARIES2_READY_TEXTURES) &&
         total <= im.sync_create_max_bytes && total <= im.sync_bytes_left) {
-      --im.sync_creates_left;
+      if (im.sync_creates_left) --im.sync_creates_left;
+      else ++im.ready_count_bypass;
       im.sync_bytes_left -= total;
       force_upload_now = true;
     }
@@ -1932,6 +2150,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
       created->host_format_swizzle = host_format.swizzle;
       created->key_hash = key_hash;
       created->content_hash = texture_hash;
+      created->payload_bytes = total;
       created->level_count = level_count;
       created->layers = layers;
       created->last_used_frame = im.frame;
@@ -1946,7 +2165,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
       stats_.upload_bytes += total;
       im.CountUpload(key_hash, base_page << 12, uint32_t(format), width, height, total,
                      texture_hash);
-      return null_view;
+      return (im.null_texture_probe && null_view == im.null_views[0]) ? im.null_views[3] : null_view;
     }
 
     VkDeviceSize staging_offset = 0;
@@ -2062,6 +2281,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     stats_.upload_bytes += total;
     im.CountUpload(key_hash, base_page << 12, uint32_t(format), width, height, total,
                    texture_hash);
+    target.payload_bytes = total;
     target.content_hash = texture_hash;
     target.key_hash = key_hash;
     if (!reuse_image) {

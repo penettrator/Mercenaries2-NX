@@ -82,3 +82,9 @@ SWITCH_PROD_KEYS=/path/to/prod.keys tools/build_forwarder.sh out/nx/mercenaries2
 | `tools/patches/` | Изменения SDK и Mesa по шагам (история) |
 | `patches/` | Итоговые изменения SDK и Mesa для сборки |
 | `extras/` | Иконка |
+
+## Тестовые оптимизации 6 ноября 2026
+
+Скрипт Switch закрепляет Docker image по digest (GCC15.2.0) и явно сбрасывает невыбранные режимы, чтобы не наследовать их из CMakeCache. Новые native-помощники и кольцевой CSV включаются отдельными `-NativeTableLookup`/`-LookupFrameCsv`; они не включаются автоматически через `-GlobalOptimizations`.
+
+Полное описание проверок, ограничений PGO, fallback и одной тестовой сессии: [производительность 6 ноября](performance-2026-11-06.md). Пользовательские профили PGO и кеш шейдеров нужно создавать локально. Монолитные патчи SDK/Mesa уже включают актуальные изменения; повторно применять их шаговые экспорты из tools/patches не нужно.

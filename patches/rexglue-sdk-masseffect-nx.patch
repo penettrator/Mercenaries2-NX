@@ -1,52 +1,3 @@
-diff --git a/sdk/include/rex/graphics/edram_census.h b/sdk/include/rex/graphics/edram_census.h
-new file mode 100644
-index 0000000..4427f70
---- /dev/null
-+++ b/sdk/include/rex/graphics/edram_census.h
-@@ -0,0 +1,43 @@
-+// EDRAM reuse census (Mercenaries 2 Switch port diagnostic, PLAN_NATIVE_RENDERER.md stage 0).
-+//
-+// Answers one question: does the game read EDRAM contents through a different render target
-+// configuration (base, pitch, MSAA, depth/colour, format) than the one that wrote them? A native
-+// renderer that keeps one host image per configuration (project8-sw) loses such contents.
-+//
-+// Off unless sdmc:/switch/Mercenaries2/logs/rex/edram_census.flag exists at startup (checked once).
-+// Every 10 s logs EDRAM_CENSUS summary lines. Only plain functions and file-local state: no SDK
-+// class layout changes.
-+#pragma once
-+
-+#include <cstdint>
-+#include <utility>
-+
-+#include <rex/graphics/registers.h>
-+#include <rex/graphics/xenos.h>
-+
-+namespace rex::graphics {
-+class RegisterFile;
-+class Shader;
-+namespace draw_util {
-+struct ResolveInfo;
-+}
-+}  // namespace rex::graphics
-+
-+namespace rex::graphics::edram_census {
-+
-+bool Enabled();
-+
-+// From RenderTargetCache::Update, before ownership changes: the render targets this draw binds.
-+// bases_sorted: (EDRAM base in tiles, bit index: 0 depth, 1 + i colour i); lengths_tiles parallel.
-+void OnDraw(const RegisterFile& regs, reg::RB_DEPTHCONTROL normalized_depth_control,
-+            uint32_t normalized_color_mask, xenos::MsaaSamples msaa_samples,
-+            uint32_t pitch_tiles_at_32bpp, const std::pair<uint32_t, uint32_t>* bases_sorted,
-+            uint32_t count, const uint32_t* lengths_tiles);
-+
-+// From the resolve path, after GetResolveInfo succeeded with a non-empty region.
-+void OnResolve(const draw_util::ResolveInfo& resolve_info);
-+
-+// From IssueDraw: whether the draw's shaders export to memory.
-+void OnShaders(bool memexport_vertex, bool memexport_pixel);
-+
-+}  // namespace rex::graphics::edram_census
 diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h b/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h
 index dbd6b01..d72a31a 100644
 --- a/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h
@@ -75,10 +26,10 @@ index dbd6b01..d72a31a 100644
  
  }  // namespace rex::graphics
 diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h b/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
-index 72cb03a..53d80d6 100644
+index 72cb03a..a11643f 100644
 --- a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
 +++ b/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
-@@ -33,7 +33,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -33,7 +33,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
      // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
      // prototyping stage (easier to do small granular updates with an
      // incremental counter).
@@ -89,10 +40,14 @@ index 72cb03a..53d80d6 100644
 +    static constexpr uint64_t kFSINoDepthLateInterlock = uint64_t(1) << 49;
 +    // Full depth/stencil tests retained; only pure, alpha-independent bodies.
 +    static constexpr uint64_t kFSIFullDepthLateInterlock = uint64_t(1) << 50;
++    // Native host-RT opt-in; bits 51/52 belong to native VPOS scale.
++    // Zero keeps the existing dynamic alpha compare, including old cache keys.
++    static constexpr uint64_t kNativeAlphaCompare = uint64_t(1) << 53;
++    static constexpr uint32_t kNativeAlphaCompareShift = 54;
  
      enum class DepthStencilMode : uint32_t {
        kNoModifiers,
-@@ -411,6 +416,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -411,6 +420,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
          draw_resolution_scale_x_(draw_resolution_scale_x ? draw_resolution_scale_x : 1),
          draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1) {}
  
@@ -110,7 +65,7 @@ index 72cb03a..53d80d6 100644
    uint64_t GetDefaultVertexShaderModification(
        uint32_t dynamic_addressable_register_count,
        Shader::HostVertexShaderType host_vertex_shader_type =
-@@ -709,7 +725,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -709,7 +729,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
    // 2x2 quads.
    bool FSI_IsDepthStencilEarly() const {
      assert_true(edram_fragment_shader_interlock_);
@@ -121,7 +76,7 @@ index 72cb03a..53d80d6 100644
             !current_shader().memexport_eM_written();
    }
    void FSI_LoadSampleMask(spv::Id msaa_samples);
-@@ -765,6 +783,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -765,6 +787,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
  
    std::unique_ptr<SpirvBuilder> builder_;
  
@@ -135,7 +90,7 @@ index 72cb03a..53d80d6 100644
    std::vector<spv::Id> id_vector_temp_;
    // For helper functions like operand loading, so they don't conflict with
    // id_vector_temp_ usage in bigger callbacks.
-@@ -881,6 +906,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -881,6 +910,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
      kSystemConstantEdramBlendConstant,
    };
    spv::Id uniform_system_constants_;
@@ -145,7 +100,7 @@ index 72cb03a..53d80d6 100644
    spv::Id uniform_float_constants_;
    spv::Id uniform_bool_loop_constants_;
    spv::Id uniform_fetch_constants_;
-@@ -1054,6 +1082,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -1054,6 +1086,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
    // main_loop_merge_.
    spv::Block* main_loop_exit_;
    spv::Id main_loop_pc_next_;
@@ -261,35 +216,6 @@ index 9d2a848..2f7d822 100644
    struct ArgsVkResetQueryPool {
      VkQueryPool query_pool;
      uint32_t first_query;
-diff --git a/sdk/include/rex/ui/vulkan/switch_shader_stats.h b/sdk/include/rex/ui/vulkan/switch_shader_stats.h
-new file mode 100644
-index 0000000..668d531
---- /dev/null
-+++ b/sdk/include/rex/ui/vulkan/switch_shader_stats.h
-@@ -0,0 +1,23 @@
-+#pragma once
-+// Opt-in diagnostics only. No shared Vulkan function-table or class layout changes.
-+#include <atomic>
-+#include <cstdio>
-+#include <rex/platform.h>
-+#include <rex/ui/vulkan/device.h>
-+namespace rex::ui::vulkan {
-+inline bool SwitchShaderStatsRequested() {
-+#if REX_PLATFORM_SWITCH
-+  static const bool requested = [] {
-+    FILE* file = std::fopen("sdmc:/switch/Mercenaries2/logs/rex/shader_stats.flag", "rb");
-+    if (!file) return false;
-+    std::fclose(file);
-+    return true;
-+  }();
-+  return requested;
-+#else
-+  return false;
-+#endif
-+}
-+// Published only after successful device creation with pipelineExecutableInfo enabled.
-+inline std::atomic<VkDevice> switch_shader_stats_device{VK_NULL_HANDLE};
-+}
 diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_switch.cpp
 index eb24fd7..ef02f70 100644
 --- a/sdk/src/core/guest_memory_switch.cpp
@@ -562,6 +488,85 @@ index 425b53b..6d47d1e 100644
        pthread_attr_destroy(&attr);
        return false;
      }
+diff --git a/sdk/src/core/threading_switch.cpp b/sdk/src/core/threading_switch.cpp
+index d083c32..03e2805 100644
+--- a/sdk/src/core/threading_switch.cpp
++++ b/sdk/src/core/threading_switch.cpp
+@@ -302,6 +302,53 @@ bool RexSwitchSetCurrentThreadCore(int core) {
+  * thread does not get to run. That is why it sits behind a cvar that is off by default and is
+  * checked in the log. See docs/platform-notes.md (Threads).
+  */
++/*
++ * Fourth core (Prototype 2 WORKLOG #100-#121): Horizon gives a process the cores of its descriptor
++ * (NPDM). The hbmenu loader allows cores 0-2; the NSP forwarder of this port allows 0-3. A thread only
++ * runs where its own mask says, so the guest threads are given the wider mask explicitly.
++ */
++uint32_t RexSwitchProcessCoreMask(void) {
++  static uint32_t cached = 0;
++  if (!cached) {
++    u64 mask = 0;
++    if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) || !(mask & 0xF)) {
++      mask = 0x7;
++    }
++    cached = uint32_t(mask & 0xF);
++  }
++  return cached;
++}
++
++bool RexSwitchSetCurrentThreadMask(uint32_t want, int spread) {
++  Thread* self = threadGetSelf();
++  Handle h = (self != nullptr) ? self->handle : CUR_THREAD_HANDLE;
++  s32 preferred = 0;
++  u64 mask = 0;
++  if (R_FAILED(svcGetThreadCoreMask(&preferred, &mask, h))) {
++    if (h == CUR_THREAD_HANDLE ||
++        R_FAILED(svcGetThreadCoreMask(&preferred, &mask, CUR_THREAD_HANDLE))) {
++      return false;
++    }
++    h = CUR_THREAD_HANDLE;
++  }
++  const u64 use = u64(want) & u64(RexSwitchProcessCoreMask()) & 0xF;
++  if (!use) return false;
++  int core = __builtin_ctzll(use);
++  if (spread >= 0) {
++    int k = spread % __builtin_popcountll(use);
++    for (int c = 0; c < 4; ++c) {
++      if (!((use >> c) & 1)) continue;
++      if (k-- == 0) {
++        core = c;
++        break;
++      }
++    }
++  } else if (preferred >= 0 && preferred < 4 && ((use >> preferred) & 1)) {
++    core = preferred;
++  }
++  return R_SUCCEEDED(svcSetThreadCoreMask(h, core, use));
++}
++
+ bool RexSwitchPinCurrentThreadToCore(int core) {
+   if (core < 0) {
+     return false;
+diff --git a/sdk/src/core/threading_switch.h b/sdk/src/core/threading_switch.h
+index c5b960a..2592898 100644
+--- a/sdk/src/core/threading_switch.h
++++ b/sdk/src/core/threading_switch.h
+@@ -169,6 +169,16 @@ bool RexSwitchPinCurrentThreadToCore(int core);
+ /* Which core the calling thread is running on right now. It can only be asked about oneself. */
+ int RexSwitchCurrentCore(void);
+ 
++/* Cores this process may use (svcGetInfo CoreMask): 0x7 with the stock hbmenu loader, 0xF when the
++ * process descriptor allows core 3 (NSP forwarder built with cores 0-3). */
++uint32_t RexSwitchProcessCoreMask(void);
++
++/* The current thread may run only on the cores of `mask` (bits 0-3). Cores outside the process mask are
++ * dropped. Preferred core: with spread >= 0 the (spread % n)-th core of the mask (round-robin over
++ * threads), otherwise the current preferred core if it stays in the mask, else the lowest one.
++ * Returns whether the kernel accepted it (false: nothing usable in the mask). */
++bool RexSwitchSetCurrentThreadMask(uint32_t mask, int spread);
++
+ #ifdef __cplusplus
+ }
+ #endif
 diff --git a/sdk/src/graphics/CMakeLists.txt b/sdk/src/graphics/CMakeLists.txt
 index ea4789c..be1428b 100644
 --- a/sdk/src/graphics/CMakeLists.txt
@@ -648,311 +653,6 @@ index 4870c8d..606ccc5 100644
      return false;
    }
  
-diff --git a/sdk/src/graphics/edram_census.cpp b/sdk/src/graphics/edram_census.cpp
-new file mode 100644
-index 0000000..991d3a0
---- /dev/null
-+++ b/sdk/src/graphics/edram_census.cpp
-@@ -0,0 +1,299 @@
-+// EDRAM reuse census, see edram_census.h.
-+#include <rex/graphics/edram_census.h>
-+
-+#include <algorithm>
-+#include <chrono>
-+#include <cstdio>
-+#include <cstdlib>
-+#include <string>
-+#include <unordered_map>
-+#include <utility>
-+#include <vector>
-+
-+#include <rex/graphics/register_file.h>
-+#include <rex/graphics/util/draw.h>
-+#include <rex/logging.h>
-+
-+namespace rex::graphics::edram_census {
-+namespace {
-+
-+// Key of one render target configuration, as a native renderer with one image per
-+// configuration would see it. Bit 31 marks a valid key.
-+constexpr uint32_t kValid = 1u << 31;
-+uint32_t MakeKey(uint32_t base, uint32_t pitch32, xenos::MsaaSamples msaa, bool is_depth,
-+                 uint32_t format) {
-+  return kValid | (base & 0x7FF) | ((pitch32 & 0x3FF) << 11) | ((uint32_t(msaa) & 3) << 21) |
-+         (uint32_t(is_depth) << 23) | ((format & 0xF) << 24);
-+}
-+uint32_t KeyBase(uint32_t k) { return k & 0x7FF; }
-+uint32_t KeyPitch(uint32_t k) { return (k >> 11) & 0x3FF; }
-+uint32_t KeyMsaa(uint32_t k) { return (k >> 21) & 3; }
-+bool KeyDepth(uint32_t k) { return (k >> 23) & 1; }
-+uint32_t KeyFormat(uint32_t k) { return (k >> 24) & 0xF; }
-+
-+// Why two keys differ, as bits.
-+enum : uint32_t {
-+  kDiffDepthColor = 1,
-+  kDiffFormatStorage = 2,  // different storage (real reinterpretation)
-+  kDiffFormatSameStorage = 4,  // e.g. 8_8_8_8 vs 8_8_8_8_GAMMA
-+  kDiffPitch = 8,
-+  kDiffMsaa = 16,
-+  kDiffBase = 32,
-+};
-+uint32_t Diff(uint32_t a, uint32_t b) {
-+  uint32_t d = 0;
-+  if (KeyDepth(a) != KeyDepth(b)) {
-+    d |= kDiffDepthColor;
-+  } else if (KeyFormat(a) != KeyFormat(b)) {
-+    bool same_storage = false;
-+    if (!KeyDepth(a)) {
-+      same_storage = xenos::GetStorageColorFormat(xenos::ColorRenderTargetFormat(KeyFormat(a))) ==
-+                     xenos::GetStorageColorFormat(xenos::ColorRenderTargetFormat(KeyFormat(b)));
-+    }
-+    d |= same_storage ? kDiffFormatSameStorage : kDiffFormatStorage;
-+  }
-+  if (KeyPitch(a) != KeyPitch(b)) d |= kDiffPitch;
-+  if (KeyMsaa(a) != KeyMsaa(b)) d |= kDiffMsaa;
-+  if (KeyBase(a) != KeyBase(b)) d |= kDiffBase;
-+  return d;
-+}
-+
-+struct Transition {
-+  uint64_t draw_reads = 0, resolve_reads = 0, overwrites = 0, tiles_read = 0;
-+};
-+
-+struct State {
-+  bool enabled = false;
-+  uint32_t owner[xenos::kEdramTileCount] = {};
-+  std::chrono::steady_clock::time_point window_start;
-+  uint64_t draws = 0, bindings = 0, reads_old = 0;
-+  uint64_t cross_draw_reads = 0, cross_draw_tiles = 0, cross_overwrites = 0;
-+  uint64_t resolves = 0, cross_resolve_reads = 0, cross_resolve_tiles = 0, clears = 0;
-+  uint64_t memexport_vs = 0, memexport_ps = 0;
-+  uint64_t diff_counts[6] = {};
-+  std::unordered_map<uint64_t, Transition> transitions;
-+};
-+
-+State& GetState() {
-+  static State state = [] {
-+    State s;
-+#if REX_PLATFORM_SWITCH
-+    if (FILE* f = std::fopen("sdmc:/switch/Mercenaries2/logs/rex/edram_census.flag", "rb")) {
-+      std::fclose(f);
-+      s.enabled = true;
-+    }
-+#else
-+    s.enabled = std::getenv("REX_EDRAM_CENSUS") != nullptr;
-+#endif
-+    s.window_start = std::chrono::steady_clock::now();
-+    if (s.enabled) REXGPU_INFO("EDRAM_CENSUS enabled=1 window=10s");
-+    return s;
-+  }();
-+  return state;
-+}
-+
-+std::string KeyText(uint32_t k) {
-+  char text[64];
-+  std::snprintf(text, sizeof(text), "%s%u@%u/p%u/%ux", KeyDepth(k) ? "D" : "C", KeyFormat(k),
-+                KeyBase(k), KeyPitch(k), 1u << KeyMsaa(k));
-+  return text;
-+}
-+
-+void MaybeReport(State& s) {
-+  auto now = std::chrono::steady_clock::now();
-+  if (now - s.window_start < std::chrono::seconds(10)) return;
-+  s.window_start = now;
-+  REXGPU_INFO(
-+      "EDRAM_CENSUS draws={} bindings={} bindings_reading_old={} cross_draw_reads={} "
-+      "cross_draw_tiles={} cross_overwrites={} resolves={} cross_resolve_reads={} "
-+      "cross_resolve_tiles={} clears={} memexport_vs={} memexport_ps={}",
-+      s.draws, s.bindings, s.reads_old, s.cross_draw_reads, s.cross_draw_tiles,
-+      s.cross_overwrites, s.resolves, s.cross_resolve_reads, s.cross_resolve_tiles, s.clears,
-+      s.memexport_vs, s.memexport_ps);
-+  REXGPU_INFO(
-+      "EDRAM_CENSUS_DIFF depth_color={} format_storage={} format_same_storage={} pitch={} "
-+      "msaa={} base={}",
-+      s.diff_counts[0], s.diff_counts[1], s.diff_counts[2], s.diff_counts[3], s.diff_counts[4],
-+      s.diff_counts[5]);
-+  std::vector<std::pair<uint64_t, Transition>> top(s.transitions.begin(), s.transitions.end());
-+  std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
-+    uint64_t ra = a.second.draw_reads + a.second.resolve_reads;
-+    uint64_t rb = b.second.draw_reads + b.second.resolve_reads;
-+    return ra != rb ? ra > rb : a.second.overwrites > b.second.overwrites;
-+  });
-+  for (size_t i = 0; i < std::min<size_t>(top.size(), 16); ++i) {
-+    uint32_t from = uint32_t(top[i].first >> 32), to = uint32_t(top[i].first);
-+    REXGPU_INFO("EDRAM_CENSUS_TOP {} -> {} draw_reads={} resolve_reads={} tiles_read={} "
-+                "overwrites={} diff=0x{:02X}",
-+                KeyText(from), KeyText(to), top[i].second.draw_reads, top[i].second.resolve_reads,
-+                top[i].second.tiles_read, top[i].second.overwrites, Diff(from, to));
-+  }
-+  s.draws = s.bindings = s.reads_old = 0;
-+  s.cross_draw_reads = s.cross_draw_tiles = s.cross_overwrites = 0;
-+  s.resolves = s.cross_resolve_reads = s.cross_resolve_tiles = s.clears = 0;
-+  s.memexport_vs = s.memexport_ps = 0;
-+  std::fill(std::begin(s.diff_counts), std::end(s.diff_counts), 0);
-+  s.transitions.clear();
-+}
-+
-+void CountDiff(State& s, uint32_t diff) {
-+  for (uint32_t i = 0; i < 6; ++i) {
-+    if (diff & (1u << i)) ++s.diff_counts[i];
-+  }
-+}
-+
-+// Reads tiles [start, start + length) (wrapping) under key. Returns the number of tiles last
-+// written under a different valid key, counting each distinct old key once in transitions.
-+uint32_t ReadRange(State& s, uint32_t key, uint32_t start, uint32_t length, bool from_resolve) {
-+  uint32_t mismatched = 0;
-+  uint32_t last_counted_old = 0;
-+  for (uint32_t i = 0; i < length && i < xenos::kEdramTileCount; ++i) {
-+    uint32_t old = s.owner[(start + i) % xenos::kEdramTileCount];
-+    if (!old || old == key) continue;
-+    ++mismatched;
-+    Transition& t = s.transitions[(uint64_t(old) << 32) | key];
-+    ++t.tiles_read;
-+    if (old != last_counted_old) {
-+      last_counted_old = old;
-+      ++(from_resolve ? t.resolve_reads : t.draw_reads);
-+      CountDiff(s, Diff(old, key));
-+    }
-+  }
-+  return mismatched;
-+}
-+
-+// Writes tiles under key; counts owner changes that did not read the old contents.
-+void WriteRange(State& s, uint32_t key, uint32_t start, uint32_t length, bool read_before) {
-+  bool counted = false;
-+  uint32_t last_old = 0;
-+  for (uint32_t i = 0; i < length && i < xenos::kEdramTileCount; ++i) {
-+    uint32_t& owner = s.owner[(start + i) % xenos::kEdramTileCount];
-+    if (owner && owner != key && !read_before) {
-+      if (owner != last_old) {
-+        last_old = owner;
-+        ++s.transitions[(uint64_t(owner) << 32) | key].overwrites;
-+      }
-+      if (!counted) {
-+        counted = true;
-+        ++s.cross_overwrites;
-+      }
-+    }
-+    owner = key;
-+  }
-+}
-+
-+bool BlendReadsDest(reg::RB_BLENDCONTROL b) {
-+  auto reads_dest_factor = [](xenos::BlendFactor f) {
-+    return f == xenos::BlendFactor::kDstColor || f == xenos::BlendFactor::kOneMinusDstColor ||
-+           f == xenos::BlendFactor::kDstAlpha || f == xenos::BlendFactor::kOneMinusDstAlpha ||
-+           f == xenos::BlendFactor::kSrcAlphaSaturate;
-+  };
-+  if (b.color_comb_fcn == xenos::BlendOp::kMin || b.color_comb_fcn == xenos::BlendOp::kMax ||
-+      b.alpha_comb_fcn == xenos::BlendOp::kMin || b.alpha_comb_fcn == xenos::BlendOp::kMax) {
-+    return true;
-+  }
-+  return b.color_destblend != xenos::BlendFactor::kZero ||
-+         b.alpha_destblend != xenos::BlendFactor::kZero || reads_dest_factor(b.color_srcblend) ||
-+         reads_dest_factor(b.alpha_srcblend);
-+}
-+
-+}  // namespace
-+
-+bool Enabled() { return GetState().enabled; }
-+
-+void OnDraw(const RegisterFile& regs, reg::RB_DEPTHCONTROL normalized_depth_control,
-+            uint32_t normalized_color_mask, xenos::MsaaSamples msaa_samples,
-+            uint32_t pitch_tiles_at_32bpp, const std::pair<uint32_t, uint32_t>* bases_sorted,
-+            uint32_t count, const uint32_t* lengths_tiles) {
-+  State& s = GetState();
-+  if (!s.enabled) return;
-+  ++s.draws;
-+  auto color_control = regs.Get<reg::RB_COLORCONTROL>();
-+  bool alpha_test = color_control.alpha_test_enable &&
-+                    color_control.alpha_func != xenos::CompareFunction::kAlways;
-+  for (uint32_t i = 0; i < count; ++i) {
-+    uint32_t base = bases_sorted[i].first;
-+    uint32_t bit = bases_sorted[i].second;
-+    uint32_t key;
-+    bool reads_old;
-+    if (bit == 0) {
-+      auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-+      key = MakeKey(base, pitch_tiles_at_32bpp, msaa_samples, true,
-+                    uint32_t(depth_info.depth_format));
-+      bool z_reads = normalized_depth_control.z_enable &&
-+                     normalized_depth_control.zfunc != xenos::CompareFunction::kAlways;
-+      reads_old = z_reads || normalized_depth_control.stencil_enable ||
-+                  (normalized_depth_control.z_enable && !normalized_depth_control.z_write_enable);
-+    } else {
-+      uint32_t rt = bit - 1;
-+      auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[rt]);
-+      key = MakeKey(base, pitch_tiles_at_32bpp, msaa_samples, false,
-+                    uint32_t(color_info.color_format));
-+      uint32_t components =
-+          xenos::GetColorRenderTargetFormatComponentCount(color_info.color_format);
-+      uint32_t full_mask = (1u << components) - 1;
-+      uint32_t mask = (normalized_color_mask >> (4 * rt)) & 0xF;
-+      auto blend =
-+          regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[rt]);
-+      reads_old = (mask & full_mask) != full_mask || BlendReadsDest(blend) || alpha_test;
-+    }
-+    ++s.bindings;
-+    if (reads_old) {
-+      ++s.reads_old;
-+      uint32_t mismatched = ReadRange(s, key, base, lengths_tiles[i], false);
-+      if (mismatched) {
-+        ++s.cross_draw_reads;
-+        s.cross_draw_tiles += mismatched;
-+      }
-+    }
-+    WriteRange(s, key, base, lengths_tiles[i], reads_old);
-+  }
-+  MaybeReport(s);
-+}
-+
-+void OnResolve(const draw_util::ResolveInfo& info) {
-+  State& s = GetState();
-+  if (!s.enabled) return;
-+  ++s.resolves;
-+  // Copy source: rows of the resolved rectangle.
-+  if (info.copy_dest_extent_length) {
-+    bool depth = info.IsCopyingDepth();
-+    const draw_util::ResolveEdramInfo& e = depth ? info.depth_edram_info : info.color_edram_info;
-+    uint32_t key = MakeKey(depth ? info.depth_original_base : info.color_original_base,
-+                           e.pitch_tiles >> e.format_is_64bpp, e.msaa_samples, depth, e.format);
-+    uint32_t base, row_length, rows, pitch;
-+    info.GetCopyEdramTileSpan(base, row_length, rows, pitch);
-+    uint32_t mismatched = 0;
-+    for (uint32_t r = 0; r < rows; ++r) {
-+      mismatched += ReadRange(s, key, base + r * pitch, row_length, true);
-+    }
-+    if (mismatched) {
-+      ++s.cross_resolve_reads;
-+      s.cross_resolve_tiles += mismatched;
-+    }
-+  }
-+  // Clears write the cleared rectangle under the cleared configuration.
-+  auto clear = [&](const draw_util::ResolveEdramInfo& e, uint32_t original_base, bool depth) {
-+    uint32_t key = MakeKey(original_base, e.pitch_tiles >> e.format_is_64bpp, e.msaa_samples,
-+                           depth, e.format);
-+    uint32_t base, row_length, rows;
-+    draw_util::GetResolveEdramTileSpan(e, info.coordinate_info, info.height_div_8, base,
-+                                       row_length, rows);
-+    for (uint32_t r = 0; r < rows; ++r) {
-+      WriteRange(s, key, base + r * e.pitch_tiles, row_length, true);
-+    }
-+    ++s.clears;
-+  };
-+  if (info.rb_copy_control.depth_clear_enable) clear(info.depth_edram_info, info.depth_original_base, true);
-+  if (info.rb_copy_control.color_clear_enable) clear(info.color_edram_info, info.color_original_base, false);
-+  MaybeReport(s);
-+}
-+
-+void OnShaders(bool memexport_vertex, bool memexport_pixel) {
-+  State& s = GetState();
-+  if (!s.enabled) return;
-+  s.memexport_vs += memexport_vertex;
-+  s.memexport_ps += memexport_pixel;
-+}
-+
-+}  // namespace rex::graphics::edram_census
 diff --git a/sdk/src/graphics/pipeline/render_target/cache.cpp b/sdk/src/graphics/pipeline/render_target/cache.cpp
 index 953c5fd..d000a15 100644
 --- a/sdk/src/graphics/pipeline/render_target/cache.cpp
@@ -1442,10 +1142,31 @@ index 46d01a9..b5cfafb 100644
  
        spv::Builder::TextureParameters texture_parameters = {};
 diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
-index 765c141..5b28af7 100644
+index 765c141..a1fb225 100644
 --- a/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
 +++ b/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
-@@ -800,8 +800,30 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+@@ -490,9 +490,17 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+     // Alpha test.
+     // TODO(Triang3l): Check how alpha test works with NaN on Direct3D 9.
+     // Extract the comparison function (less, equal, greater bits).
+-    spv::Id alpha_test_function = builder_->createTriOp(
+-        spv::OpBitFieldUExtract, type_uint_, main_system_constant_flags_,
+-        builder_->makeUintConstant(kSysFlag_AlphaPassIfLess_Shift), builder_->makeUintConstant(3));
++    const uint64_t alpha_modification = GetSpirvShaderModification().value;
++    spv::Id alpha_test_function;
++    if (!edram_fragment_shader_interlock_ &&
++        (alpha_modification & Modification::kNativeAlphaCompare)) {
++      alpha_test_function = builder_->makeUintConstant(
++          uint32_t((alpha_modification >> Modification::kNativeAlphaCompareShift) & 7));
++    } else {
++      alpha_test_function = builder_->createTriOp(
++          spv::OpBitFieldUExtract, type_uint_, main_system_constant_flags_,
++          builder_->makeUintConstant(kSysFlag_AlphaPassIfLess_Shift), builder_->makeUintConstant(3));
++    }
+     // Check if the comparison function is not "always" - that should pass even
+     // for NaN likely, unlike "less, equal or greater".
+     SpirvBuilder::IfBuilder if_alpha_test_function_is_non_always(
+@@ -800,8 +808,30 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
    spv::Block* block_fsi_if_after_depth_stencil_merge = nullptr;
  
    if (edram_fragment_shader_interlock_) {
@@ -1477,7 +1198,7 @@ index 765c141..5b28af7 100644
          // Don't do anything related to writing to the EDRAM if the pixel was
          // killed.
          id_vector_temp_.clear();
-@@ -862,17 +884,21 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+@@ -862,17 +892,21 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
        if (msaa_samples == spv::NoResult) {
          msaa_samples = LoadMsaaSamplesFromFlags();
        }
@@ -1510,7 +1231,7 @@ index 765c141..5b28af7 100644
        if (color_targets_written) {
          // Only bits 0:3 of main_fsi_sample_mask_ are written by the late
          // depth / stencil test.
-@@ -1679,6 +1705,9 @@ spv::Id SpirvShaderTranslator::FSI_AddSampleOffset(spv::Id sample_0_address, uin
+@@ -1679,6 +1713,9 @@ spv::Id SpirvShaderTranslator::FSI_AddSampleOffset(spv::Id sample_0_address, uin
  
  void SpirvShaderTranslator::FSI_DepthStencilTest(spv::Id msaa_samples,
                                                   bool sample_mask_potentially_narrowed_previouly) {
@@ -73171,123 +72892,6 @@ index b49e033..0ece57b 100644
        case Command::kVkResetQueryPool: {
          auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
          dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,
-diff --git a/sdk/src/graphics/vulkan/draw_timing_switch.inc b/sdk/src/graphics/vulkan/draw_timing_switch.inc
-new file mode 100644
-index 0000000..60e42f6
---- /dev/null
-+++ b/sdk/src/graphics/vulkan/draw_timing_switch.inc
-@@ -0,0 +1,111 @@
-+#if REX_PLATFORM_SWITCH
-+// Sparse GPU completion deltas, not isolated shader duration. All game work is retained.
-+uint32_t VulkanCommandProcessor::BeginDrawTiming(uint64_t vs, uint64_t ps,
-+                                                uint32_t vertices, uint32_t pitch) {
-+  const auto* dev = GetVulkanDevice();
-+  if (!draw_timing_checked_) {
-+    draw_timing_checked_ = true;
-+    const char* enabled = std::getenv("MERCENARIES2_GPU_DRAW_TIMING");
-+    if (!enabled || std::strcmp(enabled, "1")) return UINT32_MAX;
-+    const auto& ifn = dev->vulkan_instance()->functions();
-+    uint32_t count = 0;
-+    ifn.vkGetPhysicalDeviceQueueFamilyProperties(dev->physical_device(), &count, nullptr);
-+    std::vector<VkQueueFamilyProperties> families(count);
-+    ifn.vkGetPhysicalDeviceQueueFamilyProperties(dev->physical_device(), &count, families.data());
-+    VkPhysicalDeviceProperties properties{};
-+    ifn.vkGetPhysicalDeviceProperties(dev->physical_device(), &properties);
-+    const uint32_t family = dev->queue_family_graphics_compute();
-+    if (family >= count) return UINT32_MAX;
-+    draw_timing_valid_bits_ = families[family].timestampValidBits;
-+    draw_timing_period_ = properties.limits.timestampPeriod;
-+    // Resolve optional diagnostics directly; do not change the shared Functions ABI.
-+    const bool functions_available =
-+        ifn.vkGetDeviceProcAddr(dev->device(), "vkCmdWriteTimestamp") &&
-+        ifn.vkGetDeviceProcAddr(dev->device(), "vkGetQueryPoolResults");
-+    draw_timing_enabled_ = functions_available && draw_timing_valid_bits_ > 0 && draw_timing_valid_bits_ <= 64 &&
-+                           draw_timing_period_ > 0;
-+    REXGPU_INFO("GPU_DRAW_TIMING enabled={} stride=127 max_samples=32 max_pools=8 bits={} period_ns={} metric=bottom_completion_delta",
-+                draw_timing_enabled_, draw_timing_valid_bits_, draw_timing_period_);
-+  }
-+  if (!draw_timing_enabled_ || (++draw_timing_counter_ % 127) != 0) return UINT32_MAX;
-+  if (draw_timing_current_ == UINT32_MAX ||
-+      draw_timing_slots_[draw_timing_current_].submission != GetCurrentSubmission()) {
-+    draw_timing_current_ = UINT32_MAX;
-+    for (uint32_t i = 0; i < draw_timing_slots_.size(); ++i) {
-+      auto& slot = draw_timing_slots_[i];
-+      if (slot.submission) continue;
-+      if (slot.pool == VK_NULL_HANDLE) {
-+        VkQueryPoolCreateInfo info{};
-+        info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-+        info.queryCount = 64;
-+        if (dev->functions().vkCreateQueryPool(dev->device(), &info, nullptr, &slot.pool) != VK_SUCCESS) {
-+          draw_timing_enabled_ = false;
-+          REXGPU_WARN("GPU_DRAW_TIMING disabled: query pool creation failed");
-+          return UINT32_MAX;
-+        }
-+        slot.samples.reserve(32);
-+      }
-+      slot.submission = GetCurrentSubmission();
-+      draw_timing_current_ = i;
-+      break;
-+    }
-+  }
-+  if (draw_timing_current_ == UINT32_MAX) return UINT32_MAX; // Never wait for diagnostic space.
-+  auto& slot = draw_timing_slots_[draw_timing_current_];
-+  if (slot.samples.size() >= 32) return UINT32_MAX;
-+  uint32_t sample = uint32_t(slot.samples.size());
-+  slot.samples.push_back({vs, ps, vertices, pitch});
-+  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-+                                               slot.pool, sample * 2);
-+  return sample;
-+}
-+
-+void VulkanCommandProcessor::EndDrawTiming(uint32_t sample) {
-+  if (sample == UINT32_MAX) return;
-+  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-+      draw_timing_slots_[draw_timing_current_].pool, sample * 2 + 1);
-+}
-+
-+void VulkanCommandProcessor::CollectDrawTimings() {
-+  const auto* dev = GetVulkanDevice();
-+  for (auto& slot : draw_timing_slots_) {
-+    if (!slot.submission || slot.submission > submission_completed_) continue;
-+    uint64_t values[64][2]{}; // timestamp, availability
-+    const uint32_t queries = uint32_t(slot.samples.size()) * 2;
-+    const auto get_results = reinterpret_cast<PFN_vkGetQueryPoolResults>(
-+        dev->vulkan_instance()->functions().vkGetDeviceProcAddr(dev->device(), "vkGetQueryPoolResults"));
-+    VkResult status = get_results(dev->device(), slot.pool, 0, queries,
-+        sizeof(values), values, sizeof(values[0]),
-+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-+    const uint64_t mask = draw_timing_valid_bits_ == 64 ? UINT64_MAX :
-+                          (uint64_t(1) << draw_timing_valid_bits_) - 1;
-+    if (status == VK_SUCCESS) {
-+      for (uint32_t i = 0; i < slot.samples.size(); ++i) {
-+        if (!values[i*2][1] || !values[i*2+1][1]) continue;
-+        const auto& s = slot.samples[i];
-+        const uint64_t ticks = (values[i*2+1][0] - values[i*2][0]) & mask;
-+        REXGPU_INFO("GPU_DRAW_SAMPLE submission={} vs={:016X} ps={:016X} vertices={} pitch={} ticks={} delta_us={:.3f}",
-+            slot.submission, s.vs, s.ps, s.vertices, s.pitch, ticks,
-+            double(ticks) * draw_timing_period_ / 1000.0);
-+      }
-+    } else {
-+      REXGPU_WARN("GPU_DRAW_TIMING result discarded after completed fence: {}", int(status));
-+    }
-+    // Fence complete: pool may be reset/reused. No WAIT_BIT and no additional fence.
-+    slot.samples.clear();
-+    slot.submission = 0;
-+  }
-+}
-+
-+void VulkanCommandProcessor::ShutdownDrawTimings() {
-+  const auto* dev = GetVulkanDevice();
-+  // ShutdownContext has already waited for queue completion.
-+  for (auto& slot : draw_timing_slots_) {
-+    if (slot.pool != VK_NULL_HANDLE)
-+      dev->functions().vkDestroyQueryPool(dev->device(), slot.pool, nullptr);
-+    slot = {};
-+  }
-+  draw_timing_current_ = UINT32_MAX;
-+}
-+#endif
 diff --git a/sdk/src/graphics/vulkan/pipeline_cache.cpp b/sdk/src/graphics/vulkan/pipeline_cache.cpp
 index 43ac0ad..5a07986 100644
 --- a/sdk/src/graphics/vulkan/pipeline_cache.cpp
@@ -73542,10 +73146,10 @@ index 1fda053..4d972d4 100644
  
    // Switch the language based on game region.
 diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
-index c2903c0..199e1d0 100644
+index c2903c0..e64f368 100644
 --- a/sdk/src/system/xthread.cpp
 +++ b/sdk/src/system/xthread.cpp
-@@ -49,6 +49,17 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
+@@ -49,6 +49,38 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
  REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                      "Ignores game-specified thread affinities");
  
@@ -73560,10 +73164,70 @@ index c2903c0..199e1d0 100644
 +REXCVAR_DEFINE_UINT32(thread_delay0_main_sleep_us, 100, "Kernel",
 +                      "Like thread_delay0_sleep_us, for the game's entry-point (main) thread only");
 +
++// Mercenaries 2 optimisation 2026-10-16 (from Prototype 2 WORKLOG #80/#100/#121): thread core masks, so
++// the fourth core can be used. Core 3 needs a process descriptor that allows it (the NSP forwarder built
++// by tools/build_forwarder.sh); with the stock hbmenu loader (process mask 0x7) the core-3 bit is dropped
++// and the layout falls back to cores 0-2. run79: the game used 311 % of 300 % - all three cores full.
++REXCVAR_DEFINE_UINT32(switch_guest_core_mask, 0, "Kernel",
++                      "Switch: core mask of the guest threads (job workers, streaming, the game's own audio). "
++                      "0xF = all four cores when core 3 is allowed. 0 = unchanged")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_UINT32(switch_main_thread_mask, 0, "Kernel",
++                      "Switch: core mask of the guest \"Main XThread\" (the game's entry-point thread). "
++                      "0 = like switch_guest_core_mask")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_UINT32(switch_host_core_mask, 0, "Kernel",
++                      "Switch: core mask of the host service XThreads (native GPU ring, VSync, kernel "
++                      "dispatch) and of the native draw recorder. 0 = unchanged")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_UINT32(switch_audio_core_mask, 0, "Kernel",
++                      "Switch: core mask of the host Audio Worker / XMA Decoder threads (0x8 = core 3; "
++                      "ignored without core 3). 0 = switch_host_core_mask")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
  namespace rex::system {
  
  const uint32_t XAPC::kSize;
-@@ -464,7 +475,13 @@ X_STATUS XThread::Create() {
+@@ -357,6 +389,38 @@ int SwitchPriorityFor(bool guest_thread, std::string_view name) {
+   return REX_SWITCH_PRIO_PRESENT;  // GPU Commands, GPU VSync, Kernel Dispatch
+ }
+ 
++// switch_*_core_mask. Guest threads get their preferred core round-robin over their mask, so they do
++// not all start queued on the process default core (the kernel still migrates them inside the mask).
++void ApplySwitchCoreMask(bool guest_thread, std::string_view name) {
++  static std::atomic<uint32_t> next_guest{0};
++  static std::atomic<bool> logged{false};
++  uint32_t mask = 0;
++  int spread = -1;
++  bool audio_thread = false;
++  if (guest_thread) {
++    mask = REXCVAR_GET(switch_guest_core_mask) & 0xFu;
++    const uint32_t main_mask = REXCVAR_GET(switch_main_thread_mask) & 0xFu;
++    if (main_mask && name.starts_with("Main XThread")) mask = main_mask;
++    spread = int(next_guest.fetch_add(1, std::memory_order_relaxed) & 0xFFFF);
++  } else {
++    mask = REXCVAR_GET(switch_host_core_mask) & 0xFu;
++    const uint32_t audio = REXCVAR_GET(switch_audio_core_mask) & 0xFu;
++    if (audio && (name.starts_with("Audio Worker") || name.starts_with("XMA Decoder"))) {
++      audio_thread = true;
++      if (RexSwitchSetCurrentThreadMask(audio, -1)) mask = 0;  // done; else the host mask
++    }
++  }
++  if (mask) (void)RexSwitchSetCurrentThreadMask(mask, spread);
++  if (!logged.exchange(true, std::memory_order_relaxed)) {
++    REXSYS_INFO("[sched] process core mask 0x{:X}; thread masks: guest 0x{:X}, main 0x{:X}, host 0x{:X}, "
++                "audio 0x{:X} (0 = unchanged)",
++                RexSwitchProcessCoreMask(), REXCVAR_GET(switch_guest_core_mask),
++                REXCVAR_GET(switch_main_thread_mask), REXCVAR_GET(switch_host_core_mask),
++                REXCVAR_GET(switch_audio_core_mask));
++  }
++  (void)audio_thread;
++}
++
+ }  // namespace
+ #endif
+ 
+@@ -464,12 +528,19 @@ X_STATUS XThread::Create() {
    RetainHandle();
  
    rex::thread::Thread::CreationParameters params;
@@ -73577,7 +73241,13 @@ index c2903c0..199e1d0 100644
    params.create_suspended = true;
    thread_ = rex::thread::Thread::Create(params, [this]() {
      rex::initialize_seh_thread();
-@@ -1072,8 +1089,10 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+ #if REX_PLATFORM_SWITCH
+     RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, thread_name_));
++    ApplySwitchCoreMask(guest_thread_, thread_name_);
+ #endif
+     runtime::ThreadState::Bind(thread_state_.get());
+ 
+@@ -1072,8 +1143,10 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
      }
    } else {
      if (timeout_ms == 0) {
@@ -73590,6 +73260,46 @@ index c2903c0..199e1d0 100644
        } else {
          rex::thread::MaybeYield();
        }
+diff --git a/sdk/src/ui/rex_app.cpp b/sdk/src/ui/rex_app.cpp
+index 042bd7e..b823da0 100644
+--- a/sdk/src/ui/rex_app.cpp
++++ b/sdk/src/ui/rex_app.cpp
+@@ -68,6 +68,16 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++#if REX_PLATFORM_SWITCH
++REXCVAR_DEFINE_BOOL(achievement_notifications, false, "UI",
++                    "Show achievement popups (requires restart)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#else
++REXCVAR_DEFINE_BOOL(achievement_notifications, true, "UI",
++                    "Show achievement popups (requires restart)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#endif
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -87,7 +97,7 @@ std::unique_ptr<ui::ImGuiDialog> ReXApp::CreateAchievementsOverlay() {
+ }
+ 
+ std::unique_ptr<ui::AchievementNotificationDialog> ReXApp::CreateAchievementNotificationDialog() {
+-  if (!imgui_drawer_ || !immediate_drawer_ || !runtime_) {
++  if (!REXCVAR_GET(achievement_notifications) || !imgui_drawer_ || !immediate_drawer_ || !runtime_) {
+     return nullptr;
+   }
+   return std::make_unique<ui::AchievementToastDialog>(imgui_drawer_.get(), immediate_drawer_.get(),
+@@ -481,7 +491,8 @@ void ReXApp::LaunchModule() {
+      * session. By creating it only when the first event arrives, the game presents every frame it
+      * renders.
+      */
+-    if (achievement_notification_listener_ == 0 && runtime_ && runtime_->kernel_state()) {
++    if (REXCVAR_GET(achievement_notifications) && achievement_notification_listener_ == 0 &&
++        runtime_ && runtime_->kernel_state()) {
+       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
+           [this](const rex::system::AchievementEvent& event) {
+             rex::system::AchievementEvent copy = event;
 diff --git a/sdk/src/ui/runtime_switch.cpp b/sdk/src/ui/runtime_switch.cpp
 index 51e5e82..e8e01d1 100644
 --- a/sdk/src/ui/runtime_switch.cpp
@@ -73609,7 +73319,7 @@ index 51e5e82..e8e01d1 100644
  /*
   * The exception handler stack is no longer declared here.
 diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
-index 1976e72..5a0a308 100644
+index 1976e72..4e379f0 100644
 --- a/sdk/src/ui/switch_perf.cpp
 +++ b/sdk/src/ui/switch_perf.cpp
 @@ -44,10 +44,12 @@
@@ -73640,7 +73350,18 @@ index 1976e72..5a0a308 100644
    const bool new_value = !g_ab_active.load(std::memory_order_relaxed);
    g_ab_active.store(new_value, std::memory_order_relaxed);
    if (!new_value) {
-@@ -1034,6 +1044,19 @@ Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_m
+@@ -553,7 +563,9 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+     static TsSession ts_soc{}, ts_board{};
+     if (!ts_started) {
+       ts_started = true;
+-      if (R_SUCCEEDED(tsInitialize())) {
++      // Off (Prototype 2 runs 5-6): an open ts session for the whole game coincided with the overclock
++      // sysmodule crashing pcv/ptm under load. The clock sysmodule owns the sensors.
++      if (false && R_SUCCEEDED(tsInitialize())) {
+         has_ts = R_SUCCEEDED(tsOpenSession(&ts_soc, TsDeviceCode_LocationExternal)) &&
+                  R_SUCCEEDED(tsOpenSession(&ts_board, TsDeviceCode_LocationInternal));
+       }
+@@ -1034,6 +1046,19 @@ Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_m
    const Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
    if (R_SUCCEEDED(rc) && t) {
      Register(t->handle);
@@ -73813,3 +73534,503 @@ index e450e48..12fff2d 100644
      std::unordered_map<uint32_t, const char*> samplers;
      // MASSEFFECT: float registers set by the definition table (literal c<N> locals); an undeclared
      // register outside this set is read from the constant buffer directly.
+diff --git a/sdk/include/rex/graphics/edram_census.h b/sdk/include/rex/graphics/edram_census.h
+new file mode 100644
+index 0000000..4427f70
+--- /dev/null
++++ b/sdk/include/rex/graphics/edram_census.h
+@@ -0,0 +1,43 @@
++// EDRAM reuse census (Mercenaries 2 Switch port diagnostic, PLAN_NATIVE_RENDERER.md stage 0).
++//
++// Answers one question: does the game read EDRAM contents through a different render target
++// configuration (base, pitch, MSAA, depth/colour, format) than the one that wrote them? A native
++// renderer that keeps one host image per configuration (project8-sw) loses such contents.
++//
++// Off unless sdmc:/switch/Mercenaries2/logs/rex/edram_census.flag exists at startup (checked once).
++// Every 10 s logs EDRAM_CENSUS summary lines. Only plain functions and file-local state: no SDK
++// class layout changes.
++#pragma once
++
++#include <cstdint>
++#include <utility>
++
++#include <rex/graphics/registers.h>
++#include <rex/graphics/xenos.h>
++
++namespace rex::graphics {
++class RegisterFile;
++class Shader;
++namespace draw_util {
++struct ResolveInfo;
++}
++}  // namespace rex::graphics
++
++namespace rex::graphics::edram_census {
++
++bool Enabled();
++
++// From RenderTargetCache::Update, before ownership changes: the render targets this draw binds.
++// bases_sorted: (EDRAM base in tiles, bit index: 0 depth, 1 + i colour i); lengths_tiles parallel.
++void OnDraw(const RegisterFile& regs, reg::RB_DEPTHCONTROL normalized_depth_control,
++            uint32_t normalized_color_mask, xenos::MsaaSamples msaa_samples,
++            uint32_t pitch_tiles_at_32bpp, const std::pair<uint32_t, uint32_t>* bases_sorted,
++            uint32_t count, const uint32_t* lengths_tiles);
++
++// From the resolve path, after GetResolveInfo succeeded with a non-empty region.
++void OnResolve(const draw_util::ResolveInfo& resolve_info);
++
++// From IssueDraw: whether the draw's shaders export to memory.
++void OnShaders(bool memexport_vertex, bool memexport_pixel);
++
++}  // namespace rex::graphics::edram_census
+diff --git a/sdk/include/rex/ui/vulkan/switch_shader_stats.h b/sdk/include/rex/ui/vulkan/switch_shader_stats.h
+new file mode 100644
+index 0000000..668d531
+--- /dev/null
++++ b/sdk/include/rex/ui/vulkan/switch_shader_stats.h
+@@ -0,0 +1,23 @@
++#pragma once
++// Opt-in diagnostics only. No shared Vulkan function-table or class layout changes.
++#include <atomic>
++#include <cstdio>
++#include <rex/platform.h>
++#include <rex/ui/vulkan/device.h>
++namespace rex::ui::vulkan {
++inline bool SwitchShaderStatsRequested() {
++#if REX_PLATFORM_SWITCH
++  static const bool requested = [] {
++    FILE* file = std::fopen("sdmc:/switch/Mercenaries2/logs/rex/shader_stats.flag", "rb");
++    if (!file) return false;
++    std::fclose(file);
++    return true;
++  }();
++  return requested;
++#else
++  return false;
++#endif
++}
++// Published only after successful device creation with pipelineExecutableInfo enabled.
++inline std::atomic<VkDevice> switch_shader_stats_device{VK_NULL_HANDLE};
++}
+diff --git a/sdk/src/graphics/edram_census.cpp b/sdk/src/graphics/edram_census.cpp
+new file mode 100644
+index 0000000..991d3a0
+--- /dev/null
++++ b/sdk/src/graphics/edram_census.cpp
+@@ -0,0 +1,299 @@
++// EDRAM reuse census, see edram_census.h.
++#include <rex/graphics/edram_census.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#include <rex/graphics/register_file.h>
++#include <rex/graphics/util/draw.h>
++#include <rex/logging.h>
++
++namespace rex::graphics::edram_census {
++namespace {
++
++// Key of one render target configuration, as a native renderer with one image per
++// configuration would see it. Bit 31 marks a valid key.
++constexpr uint32_t kValid = 1u << 31;
++uint32_t MakeKey(uint32_t base, uint32_t pitch32, xenos::MsaaSamples msaa, bool is_depth,
++                 uint32_t format) {
++  return kValid | (base & 0x7FF) | ((pitch32 & 0x3FF) << 11) | ((uint32_t(msaa) & 3) << 21) |
++         (uint32_t(is_depth) << 23) | ((format & 0xF) << 24);
++}
++uint32_t KeyBase(uint32_t k) { return k & 0x7FF; }
++uint32_t KeyPitch(uint32_t k) { return (k >> 11) & 0x3FF; }
++uint32_t KeyMsaa(uint32_t k) { return (k >> 21) & 3; }
++bool KeyDepth(uint32_t k) { return (k >> 23) & 1; }
++uint32_t KeyFormat(uint32_t k) { return (k >> 24) & 0xF; }
++
++// Why two keys differ, as bits.
++enum : uint32_t {
++  kDiffDepthColor = 1,
++  kDiffFormatStorage = 2,  // different storage (real reinterpretation)
++  kDiffFormatSameStorage = 4,  // e.g. 8_8_8_8 vs 8_8_8_8_GAMMA
++  kDiffPitch = 8,
++  kDiffMsaa = 16,
++  kDiffBase = 32,
++};
++uint32_t Diff(uint32_t a, uint32_t b) {
++  uint32_t d = 0;
++  if (KeyDepth(a) != KeyDepth(b)) {
++    d |= kDiffDepthColor;
++  } else if (KeyFormat(a) != KeyFormat(b)) {
++    bool same_storage = false;
++    if (!KeyDepth(a)) {
++      same_storage = xenos::GetStorageColorFormat(xenos::ColorRenderTargetFormat(KeyFormat(a))) ==
++                     xenos::GetStorageColorFormat(xenos::ColorRenderTargetFormat(KeyFormat(b)));
++    }
++    d |= same_storage ? kDiffFormatSameStorage : kDiffFormatStorage;
++  }
++  if (KeyPitch(a) != KeyPitch(b)) d |= kDiffPitch;
++  if (KeyMsaa(a) != KeyMsaa(b)) d |= kDiffMsaa;
++  if (KeyBase(a) != KeyBase(b)) d |= kDiffBase;
++  return d;
++}
++
++struct Transition {
++  uint64_t draw_reads = 0, resolve_reads = 0, overwrites = 0, tiles_read = 0;
++};
++
++struct State {
++  bool enabled = false;
++  uint32_t owner[xenos::kEdramTileCount] = {};
++  std::chrono::steady_clock::time_point window_start;
++  uint64_t draws = 0, bindings = 0, reads_old = 0;
++  uint64_t cross_draw_reads = 0, cross_draw_tiles = 0, cross_overwrites = 0;
++  uint64_t resolves = 0, cross_resolve_reads = 0, cross_resolve_tiles = 0, clears = 0;
++  uint64_t memexport_vs = 0, memexport_ps = 0;
++  uint64_t diff_counts[6] = {};
++  std::unordered_map<uint64_t, Transition> transitions;
++};
++
++State& GetState() {
++  static State state = [] {
++    State s;
++#if REX_PLATFORM_SWITCH
++    if (FILE* f = std::fopen("sdmc:/switch/Mercenaries2/logs/rex/edram_census.flag", "rb")) {
++      std::fclose(f);
++      s.enabled = true;
++    }
++#else
++    s.enabled = std::getenv("REX_EDRAM_CENSUS") != nullptr;
++#endif
++    s.window_start = std::chrono::steady_clock::now();
++    if (s.enabled) REXGPU_INFO("EDRAM_CENSUS enabled=1 window=10s");
++    return s;
++  }();
++  return state;
++}
++
++std::string KeyText(uint32_t k) {
++  char text[64];
++  std::snprintf(text, sizeof(text), "%s%u@%u/p%u/%ux", KeyDepth(k) ? "D" : "C", KeyFormat(k),
++                KeyBase(k), KeyPitch(k), 1u << KeyMsaa(k));
++  return text;
++}
++
++void MaybeReport(State& s) {
++  auto now = std::chrono::steady_clock::now();
++  if (now - s.window_start < std::chrono::seconds(10)) return;
++  s.window_start = now;
++  REXGPU_INFO(
++      "EDRAM_CENSUS draws={} bindings={} bindings_reading_old={} cross_draw_reads={} "
++      "cross_draw_tiles={} cross_overwrites={} resolves={} cross_resolve_reads={} "
++      "cross_resolve_tiles={} clears={} memexport_vs={} memexport_ps={}",
++      s.draws, s.bindings, s.reads_old, s.cross_draw_reads, s.cross_draw_tiles,
++      s.cross_overwrites, s.resolves, s.cross_resolve_reads, s.cross_resolve_tiles, s.clears,
++      s.memexport_vs, s.memexport_ps);
++  REXGPU_INFO(
++      "EDRAM_CENSUS_DIFF depth_color={} format_storage={} format_same_storage={} pitch={} "
++      "msaa={} base={}",
++      s.diff_counts[0], s.diff_counts[1], s.diff_counts[2], s.diff_counts[3], s.diff_counts[4],
++      s.diff_counts[5]);
++  std::vector<std::pair<uint64_t, Transition>> top(s.transitions.begin(), s.transitions.end());
++  std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
++    uint64_t ra = a.second.draw_reads + a.second.resolve_reads;
++    uint64_t rb = b.second.draw_reads + b.second.resolve_reads;
++    return ra != rb ? ra > rb : a.second.overwrites > b.second.overwrites;
++  });
++  for (size_t i = 0; i < std::min<size_t>(top.size(), 16); ++i) {
++    uint32_t from = uint32_t(top[i].first >> 32), to = uint32_t(top[i].first);
++    REXGPU_INFO("EDRAM_CENSUS_TOP {} -> {} draw_reads={} resolve_reads={} tiles_read={} "
++                "overwrites={} diff=0x{:02X}",
++                KeyText(from), KeyText(to), top[i].second.draw_reads, top[i].second.resolve_reads,
++                top[i].second.tiles_read, top[i].second.overwrites, Diff(from, to));
++  }
++  s.draws = s.bindings = s.reads_old = 0;
++  s.cross_draw_reads = s.cross_draw_tiles = s.cross_overwrites = 0;
++  s.resolves = s.cross_resolve_reads = s.cross_resolve_tiles = s.clears = 0;
++  s.memexport_vs = s.memexport_ps = 0;
++  std::fill(std::begin(s.diff_counts), std::end(s.diff_counts), 0);
++  s.transitions.clear();
++}
++
++void CountDiff(State& s, uint32_t diff) {
++  for (uint32_t i = 0; i < 6; ++i) {
++    if (diff & (1u << i)) ++s.diff_counts[i];
++  }
++}
++
++// Reads tiles [start, start + length) (wrapping) under key. Returns the number of tiles last
++// written under a different valid key, counting each distinct old key once in transitions.
++uint32_t ReadRange(State& s, uint32_t key, uint32_t start, uint32_t length, bool from_resolve) {
++  uint32_t mismatched = 0;
++  uint32_t last_counted_old = 0;
++  for (uint32_t i = 0; i < length && i < xenos::kEdramTileCount; ++i) {
++    uint32_t old = s.owner[(start + i) % xenos::kEdramTileCount];
++    if (!old || old == key) continue;
++    ++mismatched;
++    Transition& t = s.transitions[(uint64_t(old) << 32) | key];
++    ++t.tiles_read;
++    if (old != last_counted_old) {
++      last_counted_old = old;
++      ++(from_resolve ? t.resolve_reads : t.draw_reads);
++      CountDiff(s, Diff(old, key));
++    }
++  }
++  return mismatched;
++}
++
++// Writes tiles under key; counts owner changes that did not read the old contents.
++void WriteRange(State& s, uint32_t key, uint32_t start, uint32_t length, bool read_before) {
++  bool counted = false;
++  uint32_t last_old = 0;
++  for (uint32_t i = 0; i < length && i < xenos::kEdramTileCount; ++i) {
++    uint32_t& owner = s.owner[(start + i) % xenos::kEdramTileCount];
++    if (owner && owner != key && !read_before) {
++      if (owner != last_old) {
++        last_old = owner;
++        ++s.transitions[(uint64_t(owner) << 32) | key].overwrites;
++      }
++      if (!counted) {
++        counted = true;
++        ++s.cross_overwrites;
++      }
++    }
++    owner = key;
++  }
++}
++
++bool BlendReadsDest(reg::RB_BLENDCONTROL b) {
++  auto reads_dest_factor = [](xenos::BlendFactor f) {
++    return f == xenos::BlendFactor::kDstColor || f == xenos::BlendFactor::kOneMinusDstColor ||
++           f == xenos::BlendFactor::kDstAlpha || f == xenos::BlendFactor::kOneMinusDstAlpha ||
++           f == xenos::BlendFactor::kSrcAlphaSaturate;
++  };
++  if (b.color_comb_fcn == xenos::BlendOp::kMin || b.color_comb_fcn == xenos::BlendOp::kMax ||
++      b.alpha_comb_fcn == xenos::BlendOp::kMin || b.alpha_comb_fcn == xenos::BlendOp::kMax) {
++    return true;
++  }
++  return b.color_destblend != xenos::BlendFactor::kZero ||
++         b.alpha_destblend != xenos::BlendFactor::kZero || reads_dest_factor(b.color_srcblend) ||
++         reads_dest_factor(b.alpha_srcblend);
++}
++
++}  // namespace
++
++bool Enabled() { return GetState().enabled; }
++
++void OnDraw(const RegisterFile& regs, reg::RB_DEPTHCONTROL normalized_depth_control,
++            uint32_t normalized_color_mask, xenos::MsaaSamples msaa_samples,
++            uint32_t pitch_tiles_at_32bpp, const std::pair<uint32_t, uint32_t>* bases_sorted,
++            uint32_t count, const uint32_t* lengths_tiles) {
++  State& s = GetState();
++  if (!s.enabled) return;
++  ++s.draws;
++  auto color_control = regs.Get<reg::RB_COLORCONTROL>();
++  bool alpha_test = color_control.alpha_test_enable &&
++                    color_control.alpha_func != xenos::CompareFunction::kAlways;
++  for (uint32_t i = 0; i < count; ++i) {
++    uint32_t base = bases_sorted[i].first;
++    uint32_t bit = bases_sorted[i].second;
++    uint32_t key;
++    bool reads_old;
++    if (bit == 0) {
++      auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
++      key = MakeKey(base, pitch_tiles_at_32bpp, msaa_samples, true,
++                    uint32_t(depth_info.depth_format));
++      bool z_reads = normalized_depth_control.z_enable &&
++                     normalized_depth_control.zfunc != xenos::CompareFunction::kAlways;
++      reads_old = z_reads || normalized_depth_control.stencil_enable ||
++                  (normalized_depth_control.z_enable && !normalized_depth_control.z_write_enable);
++    } else {
++      uint32_t rt = bit - 1;
++      auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[rt]);
++      key = MakeKey(base, pitch_tiles_at_32bpp, msaa_samples, false,
++                    uint32_t(color_info.color_format));
++      uint32_t components =
++          xenos::GetColorRenderTargetFormatComponentCount(color_info.color_format);
++      uint32_t full_mask = (1u << components) - 1;
++      uint32_t mask = (normalized_color_mask >> (4 * rt)) & 0xF;
++      auto blend =
++          regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[rt]);
++      reads_old = (mask & full_mask) != full_mask || BlendReadsDest(blend) || alpha_test;
++    }
++    ++s.bindings;
++    if (reads_old) {
++      ++s.reads_old;
++      uint32_t mismatched = ReadRange(s, key, base, lengths_tiles[i], false);
++      if (mismatched) {
++        ++s.cross_draw_reads;
++        s.cross_draw_tiles += mismatched;
++      }
++    }
++    WriteRange(s, key, base, lengths_tiles[i], reads_old);
++  }
++  MaybeReport(s);
++}
++
++void OnResolve(const draw_util::ResolveInfo& info) {
++  State& s = GetState();
++  if (!s.enabled) return;
++  ++s.resolves;
++  // Copy source: rows of the resolved rectangle.
++  if (info.copy_dest_extent_length) {
++    bool depth = info.IsCopyingDepth();
++    const draw_util::ResolveEdramInfo& e = depth ? info.depth_edram_info : info.color_edram_info;
++    uint32_t key = MakeKey(depth ? info.depth_original_base : info.color_original_base,
++                           e.pitch_tiles >> e.format_is_64bpp, e.msaa_samples, depth, e.format);
++    uint32_t base, row_length, rows, pitch;
++    info.GetCopyEdramTileSpan(base, row_length, rows, pitch);
++    uint32_t mismatched = 0;
++    for (uint32_t r = 0; r < rows; ++r) {
++      mismatched += ReadRange(s, key, base + r * pitch, row_length, true);
++    }
++    if (mismatched) {
++      ++s.cross_resolve_reads;
++      s.cross_resolve_tiles += mismatched;
++    }
++  }
++  // Clears write the cleared rectangle under the cleared configuration.
++  auto clear = [&](const draw_util::ResolveEdramInfo& e, uint32_t original_base, bool depth) {
++    uint32_t key = MakeKey(original_base, e.pitch_tiles >> e.format_is_64bpp, e.msaa_samples,
++                           depth, e.format);
++    uint32_t base, row_length, rows;
++    draw_util::GetResolveEdramTileSpan(e, info.coordinate_info, info.height_div_8, base,
++                                       row_length, rows);
++    for (uint32_t r = 0; r < rows; ++r) {
++      WriteRange(s, key, base + r * e.pitch_tiles, row_length, true);
++    }
++    ++s.clears;
++  };
++  if (info.rb_copy_control.depth_clear_enable) clear(info.depth_edram_info, info.depth_original_base, true);
++  if (info.rb_copy_control.color_clear_enable) clear(info.color_edram_info, info.color_original_base, false);
++  MaybeReport(s);
++}
++
++void OnShaders(bool memexport_vertex, bool memexport_pixel) {
++  State& s = GetState();
++  if (!s.enabled) return;
++  s.memexport_vs += memexport_vertex;
++  s.memexport_ps += memexport_pixel;
++}
++
++}  // namespace rex::graphics::edram_census
+diff --git a/sdk/src/graphics/vulkan/draw_timing_switch.inc b/sdk/src/graphics/vulkan/draw_timing_switch.inc
+new file mode 100644
+index 0000000..60e42f6
+--- /dev/null
++++ b/sdk/src/graphics/vulkan/draw_timing_switch.inc
+@@ -0,0 +1,111 @@
++#if REX_PLATFORM_SWITCH
++// Sparse GPU completion deltas, not isolated shader duration. All game work is retained.
++uint32_t VulkanCommandProcessor::BeginDrawTiming(uint64_t vs, uint64_t ps,
++                                                uint32_t vertices, uint32_t pitch) {
++  const auto* dev = GetVulkanDevice();
++  if (!draw_timing_checked_) {
++    draw_timing_checked_ = true;
++    const char* enabled = std::getenv("MERCENARIES2_GPU_DRAW_TIMING");
++    if (!enabled || std::strcmp(enabled, "1")) return UINT32_MAX;
++    const auto& ifn = dev->vulkan_instance()->functions();
++    uint32_t count = 0;
++    ifn.vkGetPhysicalDeviceQueueFamilyProperties(dev->physical_device(), &count, nullptr);
++    std::vector<VkQueueFamilyProperties> families(count);
++    ifn.vkGetPhysicalDeviceQueueFamilyProperties(dev->physical_device(), &count, families.data());
++    VkPhysicalDeviceProperties properties{};
++    ifn.vkGetPhysicalDeviceProperties(dev->physical_device(), &properties);
++    const uint32_t family = dev->queue_family_graphics_compute();
++    if (family >= count) return UINT32_MAX;
++    draw_timing_valid_bits_ = families[family].timestampValidBits;
++    draw_timing_period_ = properties.limits.timestampPeriod;
++    // Resolve optional diagnostics directly; do not change the shared Functions ABI.
++    const bool functions_available =
++        ifn.vkGetDeviceProcAddr(dev->device(), "vkCmdWriteTimestamp") &&
++        ifn.vkGetDeviceProcAddr(dev->device(), "vkGetQueryPoolResults");
++    draw_timing_enabled_ = functions_available && draw_timing_valid_bits_ > 0 && draw_timing_valid_bits_ <= 64 &&
++                           draw_timing_period_ > 0;
++    REXGPU_INFO("GPU_DRAW_TIMING enabled={} stride=127 max_samples=32 max_pools=8 bits={} period_ns={} metric=bottom_completion_delta",
++                draw_timing_enabled_, draw_timing_valid_bits_, draw_timing_period_);
++  }
++  if (!draw_timing_enabled_ || (++draw_timing_counter_ % 127) != 0) return UINT32_MAX;
++  if (draw_timing_current_ == UINT32_MAX ||
++      draw_timing_slots_[draw_timing_current_].submission != GetCurrentSubmission()) {
++    draw_timing_current_ = UINT32_MAX;
++    for (uint32_t i = 0; i < draw_timing_slots_.size(); ++i) {
++      auto& slot = draw_timing_slots_[i];
++      if (slot.submission) continue;
++      if (slot.pool == VK_NULL_HANDLE) {
++        VkQueryPoolCreateInfo info{};
++        info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++        info.queryCount = 64;
++        if (dev->functions().vkCreateQueryPool(dev->device(), &info, nullptr, &slot.pool) != VK_SUCCESS) {
++          draw_timing_enabled_ = false;
++          REXGPU_WARN("GPU_DRAW_TIMING disabled: query pool creation failed");
++          return UINT32_MAX;
++        }
++        slot.samples.reserve(32);
++      }
++      slot.submission = GetCurrentSubmission();
++      draw_timing_current_ = i;
++      break;
++    }
++  }
++  if (draw_timing_current_ == UINT32_MAX) return UINT32_MAX; // Never wait for diagnostic space.
++  auto& slot = draw_timing_slots_[draw_timing_current_];
++  if (slot.samples.size() >= 32) return UINT32_MAX;
++  uint32_t sample = uint32_t(slot.samples.size());
++  slot.samples.push_back({vs, ps, vertices, pitch});
++  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                                               slot.pool, sample * 2);
++  return sample;
++}
++
++void VulkanCommandProcessor::EndDrawTiming(uint32_t sample) {
++  if (sample == UINT32_MAX) return;
++  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++      draw_timing_slots_[draw_timing_current_].pool, sample * 2 + 1);
++}
++
++void VulkanCommandProcessor::CollectDrawTimings() {
++  const auto* dev = GetVulkanDevice();
++  for (auto& slot : draw_timing_slots_) {
++    if (!slot.submission || slot.submission > submission_completed_) continue;
++    uint64_t values[64][2]{}; // timestamp, availability
++    const uint32_t queries = uint32_t(slot.samples.size()) * 2;
++    const auto get_results = reinterpret_cast<PFN_vkGetQueryPoolResults>(
++        dev->vulkan_instance()->functions().vkGetDeviceProcAddr(dev->device(), "vkGetQueryPoolResults"));
++    VkResult status = get_results(dev->device(), slot.pool, 0, queries,
++        sizeof(values), values, sizeof(values[0]),
++        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++    const uint64_t mask = draw_timing_valid_bits_ == 64 ? UINT64_MAX :
++                          (uint64_t(1) << draw_timing_valid_bits_) - 1;
++    if (status == VK_SUCCESS) {
++      for (uint32_t i = 0; i < slot.samples.size(); ++i) {
++        if (!values[i*2][1] || !values[i*2+1][1]) continue;
++        const auto& s = slot.samples[i];
++        const uint64_t ticks = (values[i*2+1][0] - values[i*2][0]) & mask;
++        REXGPU_INFO("GPU_DRAW_SAMPLE submission={} vs={:016X} ps={:016X} vertices={} pitch={} ticks={} delta_us={:.3f}",
++            slot.submission, s.vs, s.ps, s.vertices, s.pitch, ticks,
++            double(ticks) * draw_timing_period_ / 1000.0);
++      }
++    } else {
++      REXGPU_WARN("GPU_DRAW_TIMING result discarded after completed fence: {}", int(status));
++    }
++    // Fence complete: pool may be reset/reused. No WAIT_BIT and no additional fence.
++    slot.samples.clear();
++    slot.submission = 0;
++  }
++}
++
++void VulkanCommandProcessor::ShutdownDrawTimings() {
++  const auto* dev = GetVulkanDevice();
++  // ShutdownContext has already waited for queue completion.
++  for (auto& slot : draw_timing_slots_) {
++    if (slot.pool != VK_NULL_HANDLE)
++      dev->functions().vkDestroyQueryPool(dev->device(), slot.pool, nullptr);
++    slot = {};
++  }
++  draw_timing_current_ = UINT32_MAX;
++}
++#endif

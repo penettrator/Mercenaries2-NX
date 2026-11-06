@@ -43,6 +43,7 @@ class VulkanProvider;
 namespace mercs2::native {
 
 struct RendererStats {
+  uint64_t alpha_specialized_draws = 0;
   uint64_t draws = 0;
   uint64_t draws_skipped = 0;
   uint64_t resolves = 0;
@@ -81,6 +82,15 @@ struct RendererStats {
   // How often the cached draw state and texture bindings had to be rebuilt.
   uint64_t setups_built = 0;
   uint64_t texture_bindings_built = 0;
+  uint64_t index_upload_fast_bytes = 0;
+  uint64_t dynamic_hash_bytes_skipped = 0;
+  uint64_t memo_entries_dropped = 0, memo_entries_kept = 0;
+  uint64_t depth_attachment_images = 0, depth_growth_reuses = 0, depth_extra_reserved_bytes = 0;
+#if MERCENARIES2_FRAME_CSV
+  // Counted on the ring before publishing DrawCommand; no recorder data race.
+  uint64_t descriptor_bind_calls = 0;
+  uint64_t descriptor_bind_calls_unbatched = 0;
+#endif
   // Where the last frame's time went on the ring thread, for reporting slow
   // frames: waits for texture untiling, for the GPU (a submission slot or
   // stream space), for the draw recording thread, and time spent finding
@@ -231,6 +241,9 @@ class Renderer {
   uint64_t ps_float_generation_ = 1;
   uint64_t fetch_generation_ = 1;
   uint64_t bool_loop_generation_ = 1;
+  // Startup only, before Main.Resume: finish the already loaded known cache.
+  void WaitForKnownPipelines();
+
 };
 
 }  // namespace mercs2::native

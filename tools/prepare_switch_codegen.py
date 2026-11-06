@@ -90,3 +90,6 @@ else:
 # (HANDOFF section 67).
 import subprocess, sys
 subprocess.run([sys.executable, str(root / 'tools/codegen_no_volatile.py')], check=True)
+
+# 2026-10-16 optimisation round (Prototype 2 ports): guest D3D flip hook (sub_825A0130) and dcbt -> prefetch.
+subprocess.run([sys.executable, str(root / 'tools/prepare_switch_codegen_opt.py')], check=True)

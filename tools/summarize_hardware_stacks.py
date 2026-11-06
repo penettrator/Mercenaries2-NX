@@ -1,4 +1,4 @@
-"""Summarize per-thread hardware samples; PC percentages exclude kernel waits.
+"""Summarize all sample-bearing threads; PC percentages exclude kernel waits.
 Usage: python tools/summarize_hardware_stacks.py SYMBOLIZED_LOG --last-blocks 12
 Percentages in logs are rounded and histograms truncated, so totals are approximate.
 """
@@ -13,8 +13,9 @@ def summarize(text, last_blocks):
         row = {'block': index, 'header': block.splitlines()[0], 'threads': []}
         for thread in re.split(r'(?=^-- thread )', block, flags=re.M)[1:]:
             header = thread.splitlines()[0]
-            if 'Main XThread' not in header and 'GPU Commands' not in header:
-                continue
+            # Native ports name their render threads "GPU ring native" and
+            # "GPU record"; guest workers have dynamic XThread names. Keep all
+            # sampled threads instead of silently dropping those hot spots.
             count = re.search(r'(\d+) samples, (\d+)% waiting in the kernel', thread)
             if not count:
                 continue

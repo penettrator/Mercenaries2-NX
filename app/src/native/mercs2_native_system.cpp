@@ -18,6 +18,7 @@
 //     from a stalled one. Render targets, resolves and draws are the next
 //     stages.
 
+#include "native_ring_progress.h"
 #include "mercs2_native_system.h"
 #include "../guest_pacing_stats.h"
 #include "native_renderer.h"
@@ -27,6 +28,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -52,6 +54,12 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 #include <rex/ui/windowed_app_context.h>
+
+extern "C" void mercs2_InitNativeLookups();
+
+REXCVAR_DEFINE_BOOL(mercs2_native_prewarm_before_game, false, "Mercs2",
+                    "Finish the known native shader/pipeline cache before Main starts")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // project8-sw defines this in its SDK patches; ours has no equivalent, so it lives here.
 REXCVAR_DEFINE_INT32(switch_cp_core, -1, "Mercs2",
@@ -80,6 +88,10 @@ REXCVAR_DEFINE_STRING(mercs2_renderer, "xenos", "Mercs2",
 #if defined(__SWITCH__)
 extern "C" {
 #include <switch/kernel/svc.h>
+#if MERCENARIES2_FRAME_CSV || MERCENARIES2_LOOKUP_FRAME_CSV
+#include <switch/services/hid.h>
+const char* RexSwitchLogDir(void);
+#endif
 }
 extern "C" void RexGmSetReadOnlyMapped(bool enabled);
 // The frame counter the console FPS overlay and the profiler read (the
@@ -266,6 +278,13 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     (void)blocking;
     if (renderer_ready_) {
       renderer_.InitializeDriverCache(cache_root, title_id);
+      if (REXCVAR_GET(mercs2_native_prewarm_before_game)) {
+        const auto start = std::chrono::steady_clock::now();
+        renderer_.WaitForKnownPipelines();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        REXLOG_WARN("PERF: startup prewarm complete elapsed_ms={}", elapsed);
+      }
     }
   }
 
@@ -285,6 +304,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
     }
     if (renderer_ready_) {
+#if MERCENARIES2_FRAME_CSV || MERCENARIES2_LOOKUP_FRAME_CSV
+      FinishFrameCapture();  // ring is joined: its samples no longer change
+      if (frame_writer_.joinable()) frame_writer_.join();
+#endif
       renderer_.Shutdown();
       renderer_ready_ = false;
     }
@@ -575,11 +598,24 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       reader.mask = words - 1;
       reader.pos = read;
       reader.end = written;
+#if MERCENARIES2_RING_WRITEBACK
+      uint32_t written_back = read;
+#endif
       while (reader.Pending()) {
         if (!Packet(reader, 0)) {
           // A partial packet: the rest arrives with the next CP_RB_WPTR.
           break;
         }
+#if MERCENARIES2_RING_WRITEBACK
+        if (RingProgressReached(written_back, reader.pos, reader.mask, 64) &&
+            ring_generation_.load(std::memory_order_acquire) == generation) {
+          if (const uint32_t wb = read_pointer_writeback_.load(std::memory_order_acquire)) {
+            rex::memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(wb), reader.pos);
+            ++rptr_early_writes_;
+          }
+          written_back = reader.pos;
+        }
+#endif
       }
       read = reader.pos;
       const uint32_t writeback = read_pointer_writeback_.load(std::memory_order_acquire);
@@ -591,6 +627,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   }
 
   void Report() {
+#if MERCENARIES2_RING_WRITEBACK
+    REXLOG_WARN("PERF: ring early_writebacks={} threshold_words=64", rptr_early_writes_);
+#endif
     REXLOG_INFO("[native] last 10 s: {} packets, {} draws, {} copies, {} swaps, {} waits cut short",
                 packets_ - reported_packets_, draws_ - reported_draws_, copies_ - reported_copies_,
                 swaps_ - reported_swaps_, waits_cut_short_);
@@ -601,6 +640,18 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     reported_swaps_ = swaps_;
     if (renderer_ready_) {
       const RendererStats& s = renderer_.stats();
+#if MERCENARIES2_ALPHA_COMPARE_SPECIALIZATION
+      REXLOG_WARN("PERF: alpha totals specialized_setups={} translation_limit=64", s.alpha_specialized_draws);
+#endif
+#if MERCENARIES2_DEPTH_ATTACHMENT_ONLY
+      REXLOG_WARN("PERF: depth totals attachment_images={} growth_without_copy={} extra_reserved_bytes={}",
+          s.depth_attachment_images, s.depth_growth_reuses, s.depth_extra_reserved_bytes);
+#endif
+#if MERCENARIES2_INDEX_UPLOAD_SPECIALIZATION || MERCENARIES2_DYNAMIC_UPLOAD_STAMPS || MERCENARIES2_TARGETED_MEMO
+      REXLOG_WARN("PERF: upload totals index_fast_bytes={} dynamic_hash_bytes_skipped={} "
+                  "resolve_memo_dropped={} resolve_memo_kept={}", s.index_upload_fast_bytes,
+                  s.dynamic_hash_bytes_skipped, s.memo_entries_dropped, s.memo_entries_kept);
+#endif
       REXLOG_INFO(
           "[native] renderer: {} drawn, {} skipped, {} resolves, {} passes, {} submissions, "
           "{} shaders, {} pipelines, {} textures ({} MB), {} MB vertices",
@@ -627,7 +678,11 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       uint64_t gpu_count =
           std::max<uint64_t>(s.gpu_submissions - reported_render_.gpu_submissions, 1);
       REXLOG_INFO(
+#if MERCENARIES2_LEAN_DRAW_TIMERS
+          "[native] per frame: resolve/swap CPU (draw timer OFF) {:.1f} ms, GPU {:.1f} ms over {:.1f} submissions "
+#else
           "[native] per frame: renderer CPU {:.1f} ms, GPU {:.1f} ms over {:.1f} submissions "
+#endif
           "(GPU time as the driver reports it)",
           double(s.cpu_ns - reported_render_.cpu_ns) / 1e6 / double(frames),
           double(s.gpu_ns - reported_render_.gpu_ns) / 1e6 / double(frames),
@@ -1141,6 +1196,134 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
 
   // --- Test presentation -------------------------------------------------------------
 
+#if MERCENARIES2_FRAME_CSV || MERCENARIES2_LOOKUP_FRAME_CSV
+  // Diagnostic builds only. The ring owns samples; the writer owns a moved
+  // snapshot. No SD writes or writer joins inside the measured 30 s window.
+  struct FrameSample {
+    double t_s, frame_ms;
+    uint64_t idle_ns, hold_ns, game_vblank_ns, fence_ns, stream_ns, upload_ns, drain_ns;
+    uint64_t draws, skipped, pipelines, shaders, uploads, created, binds, old_binds;
+  };
+  std::vector<FrameSample> frame_samples_;
+  std::thread frame_writer_;
+  std::atomic<bool> frame_writer_busy_{false};
+  bool frame_capture_ = false, frame_combo_down_ = false;
+  uint32_t frame_capture_index_ = 0;
+  Clock::time_point frame_capture_start_{};
+  RendererStats frame_capture_previous_{};
+  static constexpr const char* FrameVariant() {
+#if MERCENARIES2_LOOKUP_FRAME_CSV
+#if MERCENARIES2_NATIVE_TABLE_LOOKUP
+    return "native_lookup";
+#else
+    return "original_lookup";
+#endif
+#endif
+#if MERCENARIES2_DEPTH_ATTACHMENT_ONLY && MERCENARIES2_DESCRIPTOR_BATCH && MERCENARIES2_LEAN_DRAW_TIMERS && MERCENARIES2_INDEX_UPLOAD_SPECIALIZATION && MERCENARIES2_DYNAMIC_UPLOAD_STAMPS && MERCENARIES2_TARGETED_MEMO
+    return "global_pack";
+#elif MERCENARIES2_ALPHA_COMPARE_SPECIALIZATION
+    return "zcull_alpha";
+#elif MERCENARIES2_DEPTH_ATTACHMENT_ONLY
+    return "depth_zcull";
+#elif MERCENARIES2_INDEX_UPLOAD_SPECIALIZATION || MERCENARIES2_DYNAMIC_UPLOAD_STAMPS || MERCENARIES2_TARGETED_MEMO
+    return "upload_pack";
+#elif MERCENARIES2_DESCRIPTOR_BATCH && MERCENARIES2_LEAN_DRAW_TIMERS
+    return "both";
+#elif MERCENARIES2_DESCRIPTOR_BATCH
+    return "batch";
+#elif MERCENARIES2_LEAN_DRAW_TIMERS
+    return "lean";
+#else
+    return "baseline";
+#endif
+  }
+  void FinishFrameCapture() {
+    if (!frame_capture_) return;
+    frame_capture_ = false;
+    if (frame_samples_.empty()) return;
+    // A new capture cannot start while the previous writer is still busy.
+    if (frame_writer_.joinable()) frame_writer_.join();
+    frame_writer_busy_.store(true, std::memory_order_release);
+    const uint64_t id = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        frame_capture_start_.time_since_epoch()).count());
+    const bool driving = (frame_capture_index_ & 1) != 0;
+    frame_writer_ = std::thread([this, id, driving, samples = std::move(frame_samples_)]() {
+      const std::string path = std::string(RexSwitchLogDir()) + "perf_" + FrameVariant() +
+                               "_" + std::to_string(id) + ".csv";
+      FILE* file = std::fopen(path.c_str(), "wx");  // never overwrite an earlier result
+      if (file) {
+        std::fprintf(file, "run,variant,scenario,t_s,frame_ms,idle_ns,hold_ns,game_vblank_ns,"
+            "fence_ns,stream_ns,upload_wait_ns,drain_ns,draws,skipped,pipelines,shaders,"
+            "uploads,created,descriptor_calls,descriptor_calls_unbatched,draw_timer_reads_saved_min\n");
+        bool ok = true;
+        for (const auto& s : samples) {
+          ok &= std::fprintf(file,
+              "%llu,%s,%s,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+              (unsigned long long)id, FrameVariant(), driving ? "driving" : "combat",
+              s.t_s, s.frame_ms,
+              (unsigned long long)s.idle_ns, (unsigned long long)s.hold_ns,
+              (unsigned long long)s.game_vblank_ns, (unsigned long long)s.fence_ns,
+              (unsigned long long)s.stream_ns, (unsigned long long)s.upload_ns,
+              (unsigned long long)s.drain_ns, (unsigned long long)s.draws,
+              (unsigned long long)s.skipped, (unsigned long long)s.pipelines,
+              (unsigned long long)s.shaders, (unsigned long long)s.uploads,
+              (unsigned long long)s.created, (unsigned long long)s.binds,
+              (unsigned long long)s.old_binds,
+              (unsigned long long)(MERCENARIES2_LEAN_DRAW_TIMERS ? s.draws * 2 : 0)) >= 0;
+        }
+        ok &= std::fclose(file) == 0;
+        if (ok) REXLOG_WARN("PERF: saved {} frames to {}", samples.size(), path);
+        else REXLOG_ERROR("PERF: incomplete CSV {} (SD write failed)", path);
+      } else REXLOG_ERROR("PERF: cannot create CSV {}", path);
+      frame_writer_busy_.store(false, std::memory_order_release);
+    });
+  }
+  void CaptureFrame(Clock::time_point now, double ms, const RendererStats& s,
+                    uint64_t idle_ns, uint64_t hold_ns, uint64_t vblank_ns) {
+    uint64_t buttons = 0;
+    HidNpadHandheldState handheld = {};
+    if (hidGetNpadStatesHandheld(HidNpadIdType_Handheld, &handheld, 1)) buttons |= handheld.buttons;
+    HidNpadFullKeyState full = {};
+    if (hidGetNpadStatesFullKey(HidNpadIdType_No1, &full, 1)) buttons |= full.buttons;
+    HidNpadJoyDualState dual = {};
+    if (hidGetNpadStatesJoyDual(HidNpadIdType_No1, &dual, 1)) buttons |= dual.buttons;
+    const uint64_t combo = HidNpadButton_StickL | HidNpadButton_StickR;
+    const bool pressed = (buttons & combo) == combo;
+    const bool start = pressed && !frame_combo_down_;
+    frame_combo_down_ = pressed;
+    if (!frame_capture_) {
+      if (start && !frame_writer_busy_.load(std::memory_order_acquire)) {
+        if (frame_writer_.joinable()) frame_writer_.join();
+        frame_samples_.clear();
+        frame_samples_.reserve(4096);  // < 1 MiB, bounded even at 120 fps
+        frame_capture_start_ = now;
+        frame_capture_previous_ = s;
+        ++frame_capture_index_;
+        frame_capture_ = true;
+        REXLOG_WARN("PERF: capture {} variant={} (30 s), scene={}", frame_capture_index_,
+                    FrameVariant(), (frame_capture_index_ & 1) ? "driving" : "combat");
+      }
+      return;
+    }
+    const auto& p = frame_capture_previous_;
+    const double t = std::chrono::duration<double>(now - frame_capture_start_).count();
+    frame_samples_.push_back({t, ms, idle_ns, hold_ns, vblank_ns, s.frame_fence_wait_ns,
+        s.frame_stream_wait_ns, s.frame_upload_wait_ns, s.frame_drain_wait_ns,
+        s.draws - p.draws, s.draws_skipped - p.draws_skipped,
+        s.pipelines_created - p.pipelines_created, s.shaders_translated - p.shaders_translated,
+        s.textures_uploaded - p.textures_uploaded, s.textures_created - p.textures_created,
+#if MERCENARIES2_FRAME_CSV
+        s.descriptor_bind_calls - p.descriptor_bind_calls,
+        s.descriptor_bind_calls_unbatched - p.descriptor_bind_calls_unbatched
+#else
+        0, 0  // Not instrumented: preserve the profiled renderer and its struct layout.
+#endif
+        });
+    frame_capture_previous_ = s;
+    if (t >= 30.0 || frame_samples_.size() >= 4096) FinishFrameCapture();
+  }
+#endif
+
   // A frame longer than 50 ms on the ring thread, broken down, at most 12
   // per report period: the drops left are single long frames, which the 10 s
   // averages hide.
@@ -1166,6 +1349,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         1000.0;
     const RendererStats& s = renderer_.stats();
     const uint64_t pipelines = s.pipelines_created - frame_start_pipelines_;
+#if MERCENARIES2_FRAME_CSV || MERCENARIES2_LOOKUP_FRAME_CSV
+    CaptureFrame(now, ms, s, idle_ns, hold_ns, game_vblank_ns);
+#endif
     const uint64_t shaders = s.shaders_translated - frame_start_shaders_;
     const uint64_t textures = s.textures_uploaded - frame_start_textures_;
     const uint64_t created = s.textures_created - frame_start_created_;
@@ -1448,6 +1634,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   std::atomic<uint32_t> ring_generation_{0};
   std::atomic<uint32_t> write_pointer_{0};
   std::atomic<uint32_t> read_pointer_writeback_{0};
+  uint64_t rptr_early_writes_ = 0;
   std::mutex ring_mutex_;
   std::condition_variable ring_cv_;
 
@@ -1519,6 +1706,7 @@ bool Enabled() { return REXCVAR_GET(mercs2_renderer) == "native"; }
 uint64_t SwapsPresented() { return g_swaps_presented.load(std::memory_order_relaxed); }
 
 std::unique_ptr<rex::system::IGraphicsSystem> CreateGraphicsSystem() {
+  mercs2_InitNativeLookups();
   return std::make_unique<NativeGraphicsSystem>();
 }
 

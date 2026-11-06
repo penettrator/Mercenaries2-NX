@@ -1,0 +1,203 @@
+--- a/sdk/src/core/threading_switch.h
++++ b/sdk/src/core/threading_switch.h
+@@ -169,6 +169,16 @@
+ /* Which core the calling thread is running on right now. It can only be asked about oneself. */
+ int RexSwitchCurrentCore(void);
+ 
++/* Cores this process may use (svcGetInfo CoreMask): 0x7 with the stock hbmenu loader, 0xF when the
++ * process descriptor allows core 3 (NSP forwarder built with cores 0-3). */
++uint32_t RexSwitchProcessCoreMask(void);
++
++/* The current thread may run only on the cores of `mask` (bits 0-3). Cores outside the process mask are
++ * dropped. Preferred core: with spread >= 0 the (spread % n)-th core of the mask (round-robin over
++ * threads), otherwise the current preferred core if it stays in the mask, else the lowest one.
++ * Returns whether the kernel accepted it (false: nothing usable in the mask). */
++bool RexSwitchSetCurrentThreadMask(uint32_t mask, int spread);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/sdk/src/core/threading_switch.cpp
++++ b/sdk/src/core/threading_switch.cpp
+@@ -302,6 +302,53 @@
+  * thread does not get to run. That is why it sits behind a cvar that is off by default and is
+  * checked in the log. See docs/platform-notes.md (Threads).
+  */
++/*
++ * Fourth core (Prototype 2 WORKLOG #100-#121): Horizon gives a process the cores of its descriptor
++ * (NPDM). The hbmenu loader allows cores 0-2; the NSP forwarder of this port allows 0-3. A thread only
++ * runs where its own mask says, so the guest threads are given the wider mask explicitly.
++ */
++uint32_t RexSwitchProcessCoreMask(void) {
++  static uint32_t cached = 0;
++  if (!cached) {
++    u64 mask = 0;
++    if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) || !(mask & 0xF)) {
++      mask = 0x7;
++    }
++    cached = uint32_t(mask & 0xF);
++  }
++  return cached;
++}
++
++bool RexSwitchSetCurrentThreadMask(uint32_t want, int spread) {
++  Thread* self = threadGetSelf();
++  Handle h = (self != nullptr) ? self->handle : CUR_THREAD_HANDLE;
++  s32 preferred = 0;
++  u64 mask = 0;
++  if (R_FAILED(svcGetThreadCoreMask(&preferred, &mask, h))) {
++    if (h == CUR_THREAD_HANDLE ||
++        R_FAILED(svcGetThreadCoreMask(&preferred, &mask, CUR_THREAD_HANDLE))) {
++      return false;
++    }
++    h = CUR_THREAD_HANDLE;
++  }
++  const u64 use = u64(want) & u64(RexSwitchProcessCoreMask()) & 0xF;
++  if (!use) return false;
++  int core = __builtin_ctzll(use);
++  if (spread >= 0) {
++    int k = spread % __builtin_popcountll(use);
++    for (int c = 0; c < 4; ++c) {
++      if (!((use >> c) & 1)) continue;
++      if (k-- == 0) {
++        core = c;
++        break;
++      }
++    }
++  } else if (preferred >= 0 && preferred < 4 && ((use >> preferred) & 1)) {
++    core = preferred;
++  }
++  return R_SUCCEEDED(svcSetThreadCoreMask(h, core, use));
++}
++
+ bool RexSwitchPinCurrentThreadToCore(int core) {
+   if (core < 0) {
+     return false;
+--- a/sdk/src/system/xthread.cpp
++++ b/sdk/src/system/xthread.cpp
+@@ -60,6 +60,27 @@
+ REXCVAR_DEFINE_UINT32(thread_delay0_main_sleep_us, 100, "Kernel",
+                       "Like thread_delay0_sleep_us, for the game's entry-point (main) thread only");
+ 
++// Mercenaries 2 optimisation 2026-10-16 (from Prototype 2 WORKLOG #80/#100/#121): thread core masks, so
++// the fourth core can be used. Core 3 needs a process descriptor that allows it (the NSP forwarder built
++// by tools/build_forwarder.sh); with the stock hbmenu loader (process mask 0x7) the core-3 bit is dropped
++// and the layout falls back to cores 0-2. run79: the game used 311 % of 300 % - all three cores full.
++REXCVAR_DEFINE_UINT32(switch_guest_core_mask, 0, "Kernel",
++                      "Switch: core mask of the guest threads (job workers, streaming, the game's own audio). "
++                      "0xF = all four cores when core 3 is allowed. 0 = unchanged")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_UINT32(switch_main_thread_mask, 0, "Kernel",
++                      "Switch: core mask of the guest \"Main XThread\" (the game's entry-point thread). "
++                      "0 = like switch_guest_core_mask")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_UINT32(switch_host_core_mask, 0, "Kernel",
++                      "Switch: core mask of the host service XThreads (native GPU ring, VSync, kernel "
++                      "dispatch) and of the native draw recorder. 0 = unchanged")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_UINT32(switch_audio_core_mask, 0, "Kernel",
++                      "Switch: core mask of the host Audio Worker / XMA Decoder threads (0x8 = core 3; "
++                      "ignored without core 3). 0 = switch_host_core_mask")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex::system {
+ 
+ const uint32_t XAPC::kSize;
+@@ -368,6 +389,38 @@
+   return REX_SWITCH_PRIO_PRESENT;  // GPU Commands, GPU VSync, Kernel Dispatch
+ }
+ 
++// switch_*_core_mask. Guest threads get their preferred core round-robin over their mask, so they do
++// not all start queued on the process default core (the kernel still migrates them inside the mask).
++void ApplySwitchCoreMask(bool guest_thread, std::string_view name) {
++  static std::atomic<uint32_t> next_guest{0};
++  static std::atomic<bool> logged{false};
++  uint32_t mask = 0;
++  int spread = -1;
++  bool audio_thread = false;
++  if (guest_thread) {
++    mask = REXCVAR_GET(switch_guest_core_mask) & 0xFu;
++    const uint32_t main_mask = REXCVAR_GET(switch_main_thread_mask) & 0xFu;
++    if (main_mask && name.starts_with("Main XThread")) mask = main_mask;
++    spread = int(next_guest.fetch_add(1, std::memory_order_relaxed) & 0xFFFF);
++  } else {
++    mask = REXCVAR_GET(switch_host_core_mask) & 0xFu;
++    const uint32_t audio = REXCVAR_GET(switch_audio_core_mask) & 0xFu;
++    if (audio && (name.starts_with("Audio Worker") || name.starts_with("XMA Decoder"))) {
++      audio_thread = true;
++      if (RexSwitchSetCurrentThreadMask(audio, -1)) mask = 0;  // done; else the host mask
++    }
++  }
++  if (mask) (void)RexSwitchSetCurrentThreadMask(mask, spread);
++  if (!logged.exchange(true, std::memory_order_relaxed)) {
++    REXSYS_INFO("[sched] process core mask 0x{:X}; thread masks: guest 0x{:X}, main 0x{:X}, host 0x{:X}, "
++                "audio 0x{:X} (0 = unchanged)",
++                RexSwitchProcessCoreMask(), REXCVAR_GET(switch_guest_core_mask),
++                REXCVAR_GET(switch_main_thread_mask), REXCVAR_GET(switch_host_core_mask),
++                REXCVAR_GET(switch_audio_core_mask));
++  }
++  (void)audio_thread;
++}
++
+ }  // namespace
+ #endif
+ 
+@@ -487,6 +540,7 @@
+     rex::initialize_seh_thread();
+ #if REX_PLATFORM_SWITCH
+     RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, thread_name_));
++    ApplySwitchCoreMask(guest_thread_, thread_name_);
+ #endif
+     runtime::ThreadState::Bind(thread_state_.get());
+ 
+--- a/sdk/src/ui/rex_app.cpp
++++ b/sdk/src/ui/rex_app.cpp
+@@ -68,6 +68,16 @@
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++#if REX_PLATFORM_SWITCH
++REXCVAR_DEFINE_BOOL(achievement_notifications, false, "UI",
++                    "Show achievement popups (requires restart)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#else
++REXCVAR_DEFINE_BOOL(achievement_notifications, true, "UI",
++                    "Show achievement popups (requires restart)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#endif
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -87,7 +97,7 @@
+ }
+ 
+ std::unique_ptr<ui::AchievementNotificationDialog> ReXApp::CreateAchievementNotificationDialog() {
+-  if (!imgui_drawer_ || !immediate_drawer_ || !runtime_) {
++  if (!REXCVAR_GET(achievement_notifications) || !imgui_drawer_ || !immediate_drawer_ || !runtime_) {
+     return nullptr;
+   }
+   return std::make_unique<ui::AchievementToastDialog>(imgui_drawer_.get(), immediate_drawer_.get(),
+@@ -481,7 +491,8 @@
+      * session. By creating it only when the first event arrives, the game presents every frame it
+      * renders.
+      */
+-    if (achievement_notification_listener_ == 0 && runtime_ && runtime_->kernel_state()) {
++    if (REXCVAR_GET(achievement_notifications) && achievement_notification_listener_ == 0 &&
++        runtime_ && runtime_->kernel_state()) {
+       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
+           [this](const rex::system::AchievementEvent& event) {
+             rex::system::AchievementEvent copy = event;
+--- a/sdk/src/ui/switch_perf.cpp
++++ b/sdk/src/ui/switch_perf.cpp
+@@ -563,7 +563,9 @@
+     static TsSession ts_soc{}, ts_board{};
+     if (!ts_started) {
+       ts_started = true;
+-      if (R_SUCCEEDED(tsInitialize())) {
++      // Off (Prototype 2 runs 5-6): an open ts session for the whole game coincided with the overclock
++      // sysmodule crashing pcv/ptm under load. The clock sysmodule owns the sensors.
++      if (false && R_SUCCEEDED(tsInitialize())) {
+         has_ts = R_SUCCEEDED(tsOpenSession(&ts_soc, TsDeviceCode_LocationExternal)) &&
+                  R_SUCCEEDED(tsOpenSession(&ts_board, TsDeviceCode_LocationInternal));
+       }

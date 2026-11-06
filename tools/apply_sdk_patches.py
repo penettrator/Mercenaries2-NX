@@ -195,3 +195,21 @@ if "HANDOFF B:130" not in (SDK_REPO / "sdk/src/kernel/xam/xam_info.cpp").read_te
     subprocess.run(["git", "apply", "--check", str(patch)], cwd=SDK_REPO, check=True)
     subprocess.run(["git", "apply", str(patch)], cwd=SDK_REPO, check=True)
     print("Added XGetLanguage user_language")
+
+# 2026-10-16 optimisation round (HANDOFF B:139): thread core masks with the fourth core, achievement popups
+# off, no ts session; plus the native renderer recorder queue / range-table pruning in app/src (idempotent).
+subprocess.run([sys.executable, str(ROOT / 'tools/apply_opt_2026_10_16.py')], check=True)
+
+# [SHARED] Opt-in native alpha comparison in spare translation-key bits.
+alpha_header = SDK_REPO / 'sdk/include/rex/graphics/pipeline/shader/spirv_translator.h'
+alpha_source = SDK_REPO / 'sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp'
+alpha_markers = ['kNativeAlphaCompare' in alpha_header.read_text(),
+                 'const uint64_t alpha_modification' in alpha_source.read_text()]
+if not any(alpha_markers):
+    patch = ROOT / 'tools/patches/switch-native-alpha-compare.patch'
+    subprocess.run(['git', 'apply', '--check', str(patch)], cwd=SDK_REPO, check=True)
+    subprocess.run(['git', 'apply', str(patch)], cwd=SDK_REPO, check=True)
+elif not all(alpha_markers):
+    raise RuntimeError('Partial native alpha-compare SDK patch; inspect before building')
+
+# Pass14: priority experiment REJECTED; its export is kept only for history.

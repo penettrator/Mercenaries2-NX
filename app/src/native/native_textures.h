@@ -20,6 +20,10 @@
 
 #pragma once
 
+#ifndef MERCENARIES2_SLOT_SOURCE_EPOCH
+#define MERCENARIES2_SLOT_SOURCE_EPOCH 0
+#endif
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -101,6 +105,7 @@ struct TextureCacheStats {
   uint64_t pending = 0;
   // Textures whose content changed after a draw of this frame had used them.
   uint64_t replaced = 0;
+  uint64_t memo_entries_dropped = 0, memo_entries_kept = 0;
 };
 
 class TextureCache {
@@ -191,7 +196,9 @@ class TextureCache {
 
   const TextureCacheStats& stats() const { return stats_; }
   // Changes whenever image views are destroyed, so descriptor sets cached by
-  // view handle must be dropped (a new view may reuse a handle).
+  // view handle must be dropped (a new view may reuse a handle). With
+  // SLOT_SOURCE_EPOCH, also changes when source answers change. Both counters
+  // only advance; equality consumers conservatively revalidate live views.
   uint64_t views_epoch() const;
   // An id for a view that is never given to another: a handle can be reused
   // once its view is destroyed, an id cannot, so descriptor sets cached by id

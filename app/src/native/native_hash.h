@@ -97,6 +97,12 @@ class ChangeDetector {
     return hash;
   }
 
+  // Times the content was found changed, exact checks in a row that found it unchanged (both
+  // saturating), and the last hash (Prototype 2 WORKLOG #96/#97).
+  uint32_t changes() const { return changes_; }
+  uint32_t unchanged() const { return unchanged_; }
+  uint64_t last_hash() const { return hash_; }
+
  private:
   static constexpr size_t kSamples = 8;
   static constexpr size_t kSampleBytes = 64;
@@ -168,9 +174,30 @@ class FlatMap64 {
 
   size_t size() const { return size_; }
 
+  // Mutate values without erasing/reallocating open-addressed slots.
+  template<class Visitor>
+  void for_each_value(Visitor&& visit) {
+    for (size_t i = 0; i < capacity_; ++i) {
+      if (keys_[i] != kEmpty) visit(values_[i]);
+    }
+  }
+
   void clear() {
     std::fill(keys_.begin(), keys_.end(), kEmpty);
     size_ = 0;
+  }
+
+  // Keeps only the entries for which keep(value) is true (rebuilds the table at the same capacity).
+  template <typename F>
+  void retain(F&& keep) {
+    std::vector<uint64_t> old_keys = std::move(keys_);
+    std::vector<V> old_values = std::move(values_);
+    keys_.assign(old_keys.size(), kEmpty);
+    values_.assign(old_keys.size(), V());
+    size_ = 0;
+    for (size_t i = 0; i < old_keys.size(); ++i) {
+      if (old_keys[i] != kEmpty && keep(old_values[i])) (*this)[old_keys[i]] = std::move(old_values[i]);
+    }
   }
 
  private:

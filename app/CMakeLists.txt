@@ -169,5 +169,5 @@ if(REXGLUE_PLATFORM_SWITCH)
         target_link_options(mercenaries2 PRIVATE "-fprofile-use=${MERCENARIES2_PGO_DATA}"
             -fprofile-partial-training)
     endif()
-    rexglue_switch_add_nro(mercenaries2 NAME "Mercenaries 2 (development)" AUTHOR "ReXGlue port" VERSION "0.0.1")
+    rexglue_switch_add_nro(mercenaries2 NAME "Mercenaries 2: World in Flames" AUTHOR "penettrator" VERSION "0.2.0" ICON "${CMAKE_CURRENT_SOURCE_DIR}/../extras/icon.jpg")
 endif()

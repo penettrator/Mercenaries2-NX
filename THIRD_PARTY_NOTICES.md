@@ -36,3 +36,7 @@ The port's own code is under GPL-3.0 (`LICENSE`).
 Mercenaries 2: World in Flames is a trademark of its respective owners. Xbox 360 is a trademark of Microsoft.
 Nintendo Switch is a trademark of Nintendo. This project is not affiliated with or endorsed by any of them and
 does not contain any of their files. A legally owned copy of the game is required.
+
+## HOME forwarder
+
+Forwarder-Mod / nx-hbloader (ISC; see LICENSE-Forwarder-Mod.txt), built from Forwarder-Mod 9853bd9167d5a7f0c5fdf935864245c1fbcf8282. Packaging uses hacBrewPack 745b16ecfc9ce055743067d200572204cb2aac6c. The build script is tools/build_forwarder.sh.

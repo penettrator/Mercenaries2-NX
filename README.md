@@ -1,171 +1,108 @@
-Автор: [github.com/penettrator](https://github.com/penettrator)
+# Mercenaries 2: World in Flames для Nintendo Switch — 0.2.0
 
-Поддержать автора: [boosty.to/itgenius](https://boosty.to/itgenius), донаты помогают выпускать новые порты.
+[English](README.en.md)
 
-<div align=center>
+Автор порта: [penettrator](https://github.com/penettrator). Поддержка: [Boosty](https://boosty.to/itgenius). Донаты помогают выпускать новые порты.
 
-<img src="extras/icon.jpg" alt="Mercenaries 2: World in Flames - Nintendo Switch" width="256">
+Нативный порт Xbox 360 версии Mercenaries 2: World in Flames на Nintendo Switch: статическая рекомпиляция PowerPC в ARM64 через ReXGlue и собственный Vulkan-рендерер на NVK/Mesa. Нужна собственная официальная копия игры; игровые данные и кеши игры в публичный пакет не входят.
 
-</div>
-<h1 align=center>Mercenaries 2: World in Flames — Nintendo Switch</h1>
+## Что нового
 
-Нативный порт Xbox 360 версии **Mercenaries 2: World in Flames** (Pandemic Studios, 2008) на Nintendo Switch.
-Это статическая рекомпиляция: код игры (`default.xex`, PowerPC) переведён в C++ с помощью
-[ReXGlue](https://github.com/rexglue/rexglue-sdk) и собран под Horizon, графика выводится собственным рендерером
-через Vulkan (драйвер NVK из Mesa). Это не эмулятор.
-
-> [!IMPORTANT]
-> **Нужна лицензионная копия игры.** В репозитории и в релизах нет файлов игры. Нужен ваш диск
-> **Mercenaries 2: World in Flames для Xbox 360** (образ `.iso` или распакованная папка с `default.xex`).
-> Поддерживается издание с `default.xex` SHA-256 `48e805e4a2c1c4f7b409245dc9f2d02e2e8a94eaa0e9f1744d150ddce00bf72b`.
+- Оптимизированы CPU-помощники поиска и работа рендера; используется PGO.
+- Уменьшены повторные выделения памяти при загрузке текстур, добавлены ограниченные кеши материалов и изображений.
+- Исправлено замедление движения, камеры и анимаций в проверенной локации внутри здания: убрано дополнительное ограничение порта в 30 FPS.
+- Запрошенная текстура дожидается готовности загрузки вместо пустой подстановки.
+- Накопленные варианты шейдеров и pipeline прогреваются до начала игры. Тестовый захват кадров и диагностика игрового времени выключены.
 
 ## Что нужно
 
-- Nintendo Switch с кастомной прошивкой **Atmosphère**.
-- Менеджер установки NSP (**DBI**, **Sphaira** и т.п.) для иконки на главном экране, или **hbmenu** для запуска через R.
-- Плагин разгона (например, **sys-clk**), настоятельно рекомендуется.
-- Около 6.5 ГБ свободного места на SD-карте (рекомендуется exFAT).
+- Nintendo Switch с Atmosphère.
+- Не менее **8 ГБ** свободного места на SD; FAT32 подходит.
+- DBI или другой менеджер установки NSP.
+- Своя Xbox 360 копия игры. Поддерживается `default.xex` с SHA-256 `48e805e4a2c1c4f7b409245dc9f2d02e2e8a94eaa0e9f1744d150ddce00bf72b`.
 
 ## Установка
 
 ### 1. Файлы порта
 
-Скачайте из раздела [**Releases**](../../releases/latest):
+Готовые файлы распространяются через [Releases](https://github.com/penettrator/Mercenaries2-NX/releases):
 
-| Файл | Что это |
+| Файл | Назначение |
 |---|---|
-| `Mercenaries2-NX.zip` | Порт: `switch/Mercenaries2/mercenaries2.nro` и `mercenaries2.toml` |
-| `Mercenaries2-forwarder.nsp` | Иконка на главном экране Switch (форвардер) |
-| `SHA256SUMS` | Контрольные суммы |
+| `Mercenaries2-NX.zip` | Готовый порт, настройки и VERSION: `switch/Mercenaries2/` |
+| `Mercenaries2-forwarder.nsp` | Иконка HOME; разрешает использование четырёх ядер |
 
-Распакуйте `Mercenaries2-NX.zip` в корень SD-карты, получится `sdmc:/switch/Mercenaries2/`.
+Распакуйте ZIP в корень SD. Должна получиться `SD:/switch/Mercenaries2/`, без лишней папки `switch/switch`. Самостоятельная сборка для установки не нужна.
 
-### 2. Образ игры
+### 2. Своя игра
 
-Если у вас уже есть распакованная папка игры (с `default.xex` внутри), переходите к шагу 3.
-
-Образ `.iso` распаковывается утилитой **extract-xiso**:
-
-1. Скачайте её со страницы [github.com/XboxDev/extract-xiso/releases](https://github.com/XboxDev/extract-xiso/releases)
-   (для Windows файл `extract-xiso-win32-release.zip`) и распакуйте.
-2. Положите образ игры рядом с `extract-xiso.exe`, откройте в этой папке командную строку и выполните:
-   ```
-   extract-xiso.exe -x "Mercenaries 2.iso" -d game_root
-   ```
-   Вместо `Mercenaries 2.iso` подставьте имя своего файла. Можно и проще: перетащите `.iso` мышкой на
-   `extract-xiso.exe`, рядом появится папка с файлами игры (переименуйте её в `game_root`).
-3. В папке должны оказаться `default.xex`, файлы `*.wad`, `shaders.bin`, папки `audios` и `movies`
-   (всего около 6.4 ГБ). Папка `$SystemUpdate`, если есть, игре не нужна, её можно удалить.
-
-Проверить издание (необязательно):
-```
-certutil -hashfile game_root\default.xex SHA256
-```
-Должно получиться `48e805e4a2c1c4f7b409245dc9f2d02e2e8a94eaa0e9f1744d150ddce00bf72b`. Порт собран из этого
-`default.xex`, с другими изданиями игра может не запуститься или работать с ошибками.
-
-### 3. Копирование на Switch
-
-Скопируйте папку `game_root` целиком в `sdmc:/switch/Mercenaries2/`.
-
-### Структура папок
+Если игра уже распакована, назовите папку с `default.xex` **`game_root`**. Иначе распакуйте свою Xbox 360 ISO с помощью [extract-xiso](https://github.com/XboxDev/extract-xiso/releases):
 
 ```text
-sdmc:/switch/Mercenaries2/
-  ├── mercenaries2.nro     (порт)
-  ├── mercenaries2.toml    (настройки)
-  ├── game_root/           (файлы с вашего диска: default.xex, *.wad, shaders.bin, audios/, movies/)
-  └── logs/                (создаётся игрой: логи, скриншоты)
+extract-xiso.exe -x "Mercenaries 2.iso" -d game_root
 ```
 
-> [!NOTE]
-> **Обновление.** При выходе новой версии `game_root` копировать заново не нужно: распакуйте поверх новый
-> `Mercenaries2-NX.zip`. Он заменит `mercenaries2.toml`, поэтому сначала запишите свои изменённые настройки.
+Скопируйте всю `game_root` в `SD:/switch/Mercenaries2/`. Внутри должны лежать `default.xex`, `vz.wad`, `shell.wad`, папки `audios`, `movies` и остальные файлы издания. Папка `$SystemUpdate` игре не требуется.
 
-## Запуск
+```text
+SD:/switch/Mercenaries2/
+  mercenaries2.nro
+  mercenaries2.toml
+  VERSION
+  game_root/
+    default.xex
+    vz.wad
+    ...остальные файлы игры
+```
 
-### Способ 1: иконка на главном экране (рекомендуется)
+### 3. Запуск
 
-1. Установите `Mercenaries2-forwarder.nsp` через DBI, Sphaira или другой менеджер, как обычную игру.
-2. На главном экране появится иконка **Mercenaries 2: World in Flames**. Запускайте игру с неё.
+Установите **Mercenaries2-forwarder.nsp** через DBI и запустите игру с HOME без удержания R. NSP запускает NRO с SD: папку игры на карте оставьте.
 
-Форвардер не содержит игру: он запускает `sdmc:/switch/Mercenaries2/mercenaries2.nro` со всей памятью приложения
-(39-битное адресное пространство). Установить один NSP без шагов 1–3 недостаточно.
+**Форвардер уже разрешает четыре ядра. Заменять `atmosphere/hbl.nsp` и править системные файлы не нужно.**
 
-### Способ 2: через другую игру
+Альтернатива: удерживайте R при запуске обычной установленной игры, дождитесь hbmenu и выберите Mercenaries 2. Четвёртое ядро зависит от загрузчика. **Через Альбом не запускайте:** памяти недостаточно.
 
-1. Зажмите **R** и запустите любую установленную игру, откроется hbmenu в полном режиме (title override).
-2. Выберите **Mercenaries 2: World in Flames**.
+## Обновление с предыдущей версии
 
-> [!CAUTION]
-> Не запускайте через Альбом: в режиме апплета игре не хватит памяти.
-> Первый запуск дольше обычного, собирается кэш шейдеров. Со второго запуска загрузка быстрее.
+1. Полностью закройте игру: HOME → X → «Закрыть».
+2. Скопируйте на компьютер `SD:/switch/Mercenaries2/mercenaries2/` (сохранения и кеш) и свой старый TOML.
+3. Замените в `SD:/switch/Mercenaries2/` только `mercenaries2.nro`, `mercenaries2.toml`, `VERSION` из нового ZIP.
+4. Установите новый форвардер поверх старого и выберите «Продолжить».
 
-## Разгон
-
-| | Частота |
-|---|---|
-| CPU | 1571–1785 МГц |
-| GPU | 768 МГц |
-| RAM | 2133 МГц |
-
-- Видеочип использует общую с процессором память: **не снижайте частоту RAM**, иначе FPS заметно упадёт.
-- Снижение GPU ниже 768 МГц даёт сильные просадки.
-- CPU можно опустить до 1571 МГц для меньшего нагрева.
-- **После смены частот разгона игру нужно перезапустить.**
-
-Без разгона игра запускается, но FPS заметно ниже.
+`game_root` повторно копировать не нужно. Не удаляйте существующую папку игры и вложенную `mercenaries2`: сохранения лежат там. Если меняли язык или другие настройки, перенесите нужные значения в новый TOML; не возвращайте старый файл целиком.
 
 ## Настройки
 
-Все настройки в `sdmc:/switch/Mercenaries2/mercenaries2.toml`. Изменения применяются после перезапуска игры.
+Файл: **`SD:/switch/Mercenaries2/mercenaries2.toml`**. После правок полностью перезапустите игру.
 
-| Параметр | По умолчанию | Описание |
+| Параметр | Значение | Назначение |
 |---|---|---|
-| `user_language` | `12` | Язык игры: `12` — русский, `1` — английский |
-| `present_effect` | `"fsr"` | Апскейл на экран: `"fsr"`, `"cas"` (только резкость), `"bilinear"` |
-| `mercs2_native_shadow_max_cascades` | `3` | Каскады теней: `4` — дальние тени как в оригинале (медленнее) |
-| `mercs2_native_max_anisotropy` | `8` | Анизотропная фильтрация (1–16) |
-| `mercs2_native_texture_pool` | `true` | Общий пул видеопамяти для текстур (меньше рывков) |
+| `user_language` | `12` | `12` — русский, `1` — английский; текст и озвучка зависят от издания |
+| `present_effect` | `"fsr"` | FSR 1, внутреннее разрешение 960×544 |
+| `achievement_notifications` | `false` | Уведомления достижений выключены |
+| `mercs2_min_frame_vblanks` | `1` | Сохранение кадрового темпа игры, включая помещения |
+| `mercs2_native_texture_demand_wait` | `true` | Дождаться востребованной текстуры вместо пустого материала |
+| `mercs2_native_prewarm_before_game` | `true` | Прогреть известный кеш pipeline до начала игры |
 
-## Известные проблемы
+Проверки проводились в handheld на CPU1785 / GPU768 / RAM2200 МГц. Порт сам не задаёт частоты; этот профиль измерений не является универсальным требованием для всех ревизий Switch.
 
-- Просадки FPS при езде на технике и в перестрелках с большим количеством взрывов.
-- Дальние тени (дальше ~130 м) отключены ради производительности, см. `mercs2_native_shadow_max_cascades`.
+## Известные ограничения
 
-## Как это устроено
+- При въезде в новую локацию могут сохраняться просадки и краткое мерцание материалов зданий. Полное устранение этого дефекта не подтверждено.
+- Прогрев покрывает накопленные варианты; неизвестные шейдеры и состояния pipeline ещё могут создаваться при первом появлении. Первый запуск без собственного кеша может быть менее плавным.
+- В конфиге сохранены 3 каскада теней и прежние настройки эффектов; дальние тени ограничены относительно оригинала.
 
-Это не эмулятор. Машинный код PowerPC из `default.xex` заранее переводится в C++ утилитой
-[ReXGlue](https://github.com/rexglue/rexglue-sdk) и компилируется в ARM64-код для Horizon (Switch). Ядро и рантайм
-Xbox 360 (потоки, память, файлы, звук XMA) реализованы в SDK. Команды видеочипа Xenos переводит в Vulkan собственный
-рендерер порта (`app/src/native`), который работает поверх драйвера NVK из Mesa. Сцена рисуется в 960x544 и
-растягивается на экран через AMD FSR 1.
+## Исходники, благодарности и лицензии
 
-Сгенерированный из игры код (`app/generated`) в репозиторий не входит: он создаётся при сборке из вашего `default.xex`.
+Инструкции разработчикам: [сборка на русском](docs/building.md), [English build guide](docs/building.en.md). Изменения версии: [CHANGELOG.md](CHANGELOG.md). Сгенерированный код, образы, сохранения, сырые PGO-профили и кеши игры в Git не включаются.
 
-## Благодарности
+- [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) / [Xenia](https://xenia.jp).
+- [masseffect-nx](https://github.com/nebadasSwifty/masseffect-nx).
+- [project8-sw](https://github.com/R-drg/project8-sw), [the-simpsons-game-nx](https://github.com/R-drg/the-simpsons-game-nx), [NFSMW-NX](https://github.com/StevensND/NFSMW-NX).
+- [Prototype2-NX](https://github.com/penettrator/Prototype2-NX) — опыт общих оптимизаций.
+- [mesa-switch](https://github.com/danfromtico/mesa-switch) / [Mesa](https://mesa3d.org).
+- [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR).
+- [Forwarder-Mod](https://github.com/Skywalker25/Forwarder-Mod) / nx-hbloader, [hacBrewPack](https://github.com/rlaphoenix/hacBrewPack).
 
-- [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) и [Xenia](https://xenia.jp) — рекомпилятор, рантайм Xbox 360, обработка команд GPU.
-- [masseffect-nx](https://github.com/nebadasSwifty/masseffect-nx) — SDK для Horizon и опыт оптимизаций.
-- [project8-sw](https://github.com/R-drg/project8-sw), [the-simpsons-game-nx](https://github.com/R-drg/the-simpsons-game-nx),
-  [NFSMW-NX](https://github.com/StevensND/NFSMW-NX) — нативный рендерер и слой Horizon.
-- [mesa-switch](https://github.com/danfromtico/mesa-switch) и [Mesa](https://mesa3d.org) — драйвер Vulkan (NVK/NAK) для Switch.
-- [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) — апскейл.
-
-## Поддержка
-
-Если порт вам понравился, поддержать автора можно на [boosty.to/itgenius](https://boosty.to/itgenius):
-донаты помогают выпускать новые порты.
-
-## Лицензия
-
-Код порта распространяется по лицензии **GPL-3.0** (см. [LICENSE](LICENSE)).
-Сторонние компоненты — под своими лицензиями (BSD-3-Clause, MIT, LGPL-2.1 и др.), см.
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-Mercenaries 2: World in Flames — торговая марка ее правообладателей. Проект не связан с Electronic Arts,
-Pandemic Studios, Microsoft или Nintendo и не содержит их файлов.
-
-## Тестовая ветка производительности — 6 ноября 2026
-
-Добавлены проверяемые native-помощники поиска в таблицах, захват кадров без изменения профиля renderer, ограниченные кеши загрузки и строгий PGO workflow. Новые функции по умолчанию выключены; аппаратный FPS-выигрыш нового пакета ещё не установлен. [Изменения и порядок одной проверки](docs/performance-2026-11-06.md).
+Код порта — GPL-3.0: [LICENSE](LICENSE). Сторонние компоненты: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [лицензия форвардера](LICENSE-Forwarder-Mod.txt). Проект не связан с Electronic Arts, Pandemic Studios, Microsoft или Nintendo.

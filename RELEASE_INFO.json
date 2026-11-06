@@ -1,0 +1,36 @@
+{
+  "version": "0.2.0",
+  "kind": "source-and-binary-distribution",
+  "platform": "Nintendo Switch",
+  "technology": [
+    "ReXGlue0.10.0",
+    "ARM64",
+    "Vulkan",
+    "NVK/Mesa"
+  ],
+  "author": "penettrator",
+  "support": "https://boosty.to/itgenius",
+  "game_data_included": false,
+  "shader_cache_included": false,
+  "personal_saves_included": false,
+  "ready_files": [
+    "Mercenaries2-NX.zip",
+    "Mercenaries2-forwarder.nsp"
+  ],
+  "resolution": [
+    960,
+    544
+  ],
+  "upscaling": "FSR1",
+  "optimization": "PGO USE",
+  "original_profiles_used": 161,
+  "frame_csv": false,
+  "game_timing_diagnostics": false,
+  "achievement_notifications": false,
+  "nro_sha256": "3ab610895fafeb3eb1b08f42b0d29e919bdca7ad41b1a63eaf36b9399f5e7fde",
+  "toml_sha256": "fde6e30902e60d889e461c3c641c1fa507dc718e1b6b84527bd3bb1e790daa16",
+  "forwarder_sha256": "195851e29e2c9198060a7d8d20615156ae32e97413ccfebb7d25fa18e2ff7a06",
+  "final_release_binary_device_check": "pending",
+  "known_issue": "Brief building-material flicker/frame drops may persist at new-area transitions",
+  "publication": "prepared locally; no push/release performed"
+}

@@ -22,3 +22,10 @@ logs/
 *.profraw
 *.nro
 *.nsp
+
+# Prepared packages stay local; track config/ as the settings source.
+/*.zip
+/switch/
+**/cache/
+config/pgo-data/
+/SHA256SUMS

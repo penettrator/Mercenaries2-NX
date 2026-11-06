@@ -21,7 +21,7 @@ KEYS="$(cd "$(dirname "$KEYS")" && pwd)/$(basename "$KEYS")"
 w() { if command -v cygpath >/dev/null; then cygpath -w "$1"; else echo "$1"; fi; }
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(w "$WORK"):/work" -v "$(w "$OUT"):/output" \
   -v "$(w "$KEYS"):/run/keys/prod.keys:ro" -e TITLE_ID="$TITLE_ID" -e NRO_SD_PATH="$NRO_SD_PATH" \
-  -w /work "${DEVKITA64_IMAGE:-devkitpro/devkita64:latest}" bash -euo pipefail -c '
+  -w /work "${DEVKITA64_IMAGE:-devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282}" bash -euo pipefail -c '
     python3 - <<"PY"
 import json, os, pathlib, struct
 root = pathlib.Path("/work")

@@ -44,7 +44,9 @@ for(unsigned n=0;n<4096;++n)for(unsigned which=0;which<2;++which){
  for(unsigned i=0;i<cap;++i){Put(data.data(),4096+i*4,UINT32_MAX);Put(data.data(),16384+i*4,UINT32_MAX);}
  unsigned probes=rng()%std::min(cap,9u);bool hit=n%3!=0;
  for(unsigned i=0;i<=probes;++i){unsigned s=(slot+i)%cap;bool last=i==probes;if(which)Put(data.data(),16384+s*4,last?(hit?key:UINT32_MAX):(key^0x31415926));else{Put(data.data(),4096+s*4,last&&!hit?UINT32_MAX:s);Put(data.data(),16384+s*4,last&&hit?key:(key^0x31415926));}}
- PPCContext original{};for(unsigned i=0;i<32;++i){uint64_t v=rng();std::memcpy(reinterpret_cast<uint8_t*>(&original.r0)+i*sizeof(original.r0),&v,8);}original.lr=rng();original.ctr.u64=rng();original.r3.u64=256;original.r4.u64=uint64_t(rng())<<32|key;original.r5.u64=hashed?UINT64_MAX:slot;
+ PPCContext original{};for(unsigned i=0;i<32;++i){uint64_t v=rng();std::memcpy(reinterpret_cast<uint8_t*>(&original.r0)+i*sizeof(original.r0),&v,8);}original.lr=rng();original.ctr.u64=rng();original.r3.u64=256;original.r4.u64=uint64_t(rng())<<32|key;original.r5.u64=hashed?UINT64_MAX:((rng()<<32)|slot);
+ // Capacity sign bit and nonzero high GPR halves must retain exact PPC effects.
+ if(n%97==0){const uint32_t wide=(n&1)?UINT32_MAX:0x80000000u;Put(data.data(),264,wide);Put(data.data(),268,0);if(which)Put(data.data(),276,0);original.r4.u64&=0xffffffff00000000ULL;original.r5.u64=UINT64_MAX;Put(data.data(),4096,0);Put(data.data(),4100,1);Put(data.data(),16384,(n%4==3)?0:1);Put(data.data(),16388,0);}
  if(n%41==0)Put(data.data(),256,0);if(n%43==0)Put(data.data(),264,0);
  mutation=0;if((n==2||n==4)&&!which){mutation=n==2?1:2;cap=1;slot=0;Put(data.data(),256,1);Put(data.data(),264,1);Put(data.data(),4096,0);Put(data.data(),4100,1);Put(data.data(),16384,key^0x31415926);Put(data.data(),16388,key);original.r5.u64=0;}
  desired=key;PPCContext native{};std::memcpy(&native,&original,sizeof(native));fb->bytes=data;

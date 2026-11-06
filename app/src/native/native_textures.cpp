@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -526,6 +527,11 @@ REXCVAR_DEFINE_BOOL(mercs2_native_texture_pool, false, "Mercs2",
                     "HANDOFF B:131: guest textures share 64 MB device memory blocks instead of one "
                     "allocation each (an allocation is several kernel round trips, ~3 ms per new "
                     "texture in explosions); restart required");
+// Correctness mode: a referenced stream must be ready before its draw is recorded.
+// Original asynchronous placeholder path remains available at startup.
+REXCVAR_DEFINE_BOOL(mercs2_native_texture_demand_wait, false, "Mercs2",
+                    "Wait for a referenced texture's existing stream instead of drawing it empty")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(mercs2_native_null_texture_probe, false, "Mercs2",
                     "Diagnostic only: mark pending 2D stream lookups magenta, alpha unchanged; restart required")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -700,6 +706,32 @@ struct TextureCache::Impl {
   std::thread stream_threads[2];
   std::mutex stream_mutex;
   std::condition_variable stream_cv;
+  std::condition_variable stream_done_cv;
+  bool demand_wait = false;
+  uint64_t demand_waits = 0, demand_wait_ns = 0, demand_wait_max_ns = 0;
+
+  bool WaitForStream(StreamJob& job) {
+    if (job.done.load(std::memory_order_acquire)) return true;
+    const auto begin = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(stream_mutex);
+    stream_done_cv.wait(lock, [&] {
+      return job.done.load(std::memory_order_acquire) || stream_stop;
+    });
+    const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin).count());
+    ++demand_waits;
+    demand_wait_ns += ns;
+    demand_wait_max_ns = std::max(demand_wait_max_ns, ns);
+    return job.done.load(std::memory_order_acquire);
+  }
+
+  void PublishStream(StreamJob& job) {
+    // Same mutex as the wait predicate: no completion between checking it and sleeping.
+    { std::lock_guard<std::mutex> lock(stream_mutex);
+      job.done.store(true, std::memory_order_release); }
+    stream_done_cv.notify_all();
+  }
+
   std::deque<std::shared_ptr<StreamJob>> stream_jobs;
   bool stream_stop = false;
 
@@ -723,7 +755,7 @@ struct TextureCache::Impl {
         job->untile.staging = static_cast<uint8_t*>(mapping);
         RunUntile(job->untile);
       }
-      job->done.store(true, std::memory_order_release);
+      PublishStream(*job);
     }
   }
 
@@ -1077,6 +1109,8 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
   im.device = device;
   im.memory = memory;
   im.texture_pool = REXCVAR_GET(mercs2_native_texture_pool);
+  im.demand_wait = REXCVAR_GET(mercs2_native_texture_demand_wait);
+  if (im.demand_wait) REXLOG_WARN("CORRECT: demand texture readiness enabled; no pending-stream placeholders");
   im.staging_pool_budget = uint64_t(std::min(REXCVAR_GET(mercs2_native_staging_pool_mb), 16u)) << 20;
   im.staging_pool_stopping = false;
   im.null_texture_probe = REXCVAR_GET(mercs2_native_null_texture_probe);
@@ -1193,6 +1227,7 @@ void TextureCache::Shutdown() {
       im.stream_stop = true;
     }
     im.stream_cv.notify_all();
+    im.stream_done_cv.notify_all();
     for (std::thread& thread : im.stream_threads) {
       if (thread.joinable()) thread.join();
     }
@@ -1390,6 +1425,11 @@ void TextureCache::BeginFrame(uint64_t frame, uint64_t completed_frame) {
                 im.material_payload_bytes, uint64_t(128) << 20, im.material_evictions, im.textures.size(), im.material_reaped_streams);
   }
 #endif
+  if (im.demand_wait && frame % 300 == 0) {
+    REXLOG_WARN("CORRECT: demand texture waits={} total_ns={} max_ns={} pending={} streamed={}",
+                im.demand_waits, im.demand_wait_ns, im.demand_wait_max_ns,
+                stats_.pending, stats_.streamed);
+  }
   if (im.staging_pool_budget && frame % 300 == 0) {
     std::lock_guard<std::mutex> lock(im.staging_pool_mutex);
     REXLOG_WARN("PERF: staging reuse created={} reused={} returned={} idle={} bytes={} budget={}",
@@ -1973,6 +2013,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     pending.last_used_frame = im.frame;  // last request, even while its worker is pending
 #endif
     StreamJob& job = *pending.stream;
+    if (im.demand_wait && !im.WaitForStream(job)) return null_view;
     if (!job.done.load(std::memory_order_acquire)) {
       // Still streaming in: drawn without it for now.
       ++stats_.pending;
@@ -2025,6 +2066,12 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     im.retired_staging.push_back({im.frame, pending.stream});
     pending.stream.reset();
     ++stats_.streamed;
+    if (im.demand_wait) {
+      ++stats_.uploads;
+      stats_.upload_bytes += job.staging_size;
+      im.CountUpload(key_hash, base_page << 12, uint32_t(format), width, height,
+                     job.staging_size, pending.content_hash);
+    }
   }
   if (existing != im.textures.end()) {
     Texture& old = *existing->second;
@@ -2161,6 +2208,13 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
         im.stream_jobs.push_back(job);
       }
       im.stream_cv.notify_one();
+      if (im.demand_wait) {
+        // Keep the same workers/allocation/staging/fences. Re-enter once to run the
+        // existing promotion/upload path. The next lookup sees this same job;
+        // success promotes it, failure removes it, cancellation returns empty.
+        // No new job can be enqueued by this recursion.
+        return GetViewUncached(fetch, dimension, is_signed, upload, null_view);
+      }
       ++stats_.uploads;
       stats_.upload_bytes += total;
       im.CountUpload(key_hash, base_page << 12, uint32_t(format), width, height, total,

@@ -37,6 +37,7 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/chrono/clock.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
@@ -56,6 +57,10 @@
 #include <rex/ui/windowed_app_context.h>
 
 extern "C" void mercs2_InitNativeLookups();
+
+REXCVAR_DEFINE_BOOL(mercs2_game_timing_diagnostics, false, "Mercs2",
+                    "Read-only 5s clock/engine timescale diagnostics for interior slowdown")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(mercs2_native_prewarm_before_game, false, "Mercs2",
                     "Finish the known native shader/pipeline cache before Main starts")
@@ -221,6 +226,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     dispatcher_ = dispatcher;
     kernel_state_ = kernel_state;
     memory_ = dispatcher->memory();
+    game_timing_diagnostics_ = REXCVAR_GET(mercs2_game_timing_diagnostics);
     if (!renderer_ready_ && provider_) {
       renderer_ready_ = renderer_.Initialize(provider_.get(), memory_, register_file_.get());
       packet_trace_enabled_ = renderer_ready_ && renderer_.water_dump_enabled();
@@ -1327,8 +1333,46 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   // A frame longer than 50 ms on the ring thread, broken down, at most 12
   // per report period: the drops left are single long frames, which the 10 s
   // averages hide.
+  void ReportGameTiming(Clock::time_point now) {
+    if (!game_timing_diagnostics_) return;
+    const double host_s = std::chrono::duration<double>(now - timing_previous_).count();
+    if (timing_previous_.time_since_epoch().count() && host_s < 5.0) return;
+    const uint64_t ticks = rex::chrono::Clock::QueryGuestTickCount();
+    const uint64_t frequency = rex::chrono::Clock::guest_tick_frequency();
+    const uint64_t vb = vblanks_.load(std::memory_order_acquire);
+    const uint64_t swaps = swaps_;
+    const bool previous = timing_previous_.time_since_epoch().count() != 0;
+    const double guest_s = previous && frequency && ticks >= timing_ticks_
+                               ? double(ticks - timing_ticks_) / double(frequency) : 0.0;
+    // Exact local XEX: Net.SetBriefingInterior binding8232D5E8, Sys.SetTimeScale
+    // binding82344A40. The latter writes engine clock object+60 via this global.
+    // Read only, check both ranges; do not dereference an absent/unmapped object.
+    auto readable = [this](uint32_t address, uint32_t bytes) {
+      if (!memory_ || !address || address > UINT32_MAX - (bytes - 1)) return false;
+      auto* heap = memory_->LookupHeap(address);
+      return heap && heap->QueryRangeAccess(address, address + bytes - 1) !=
+                         rex::memory::PageAccess::kNoAccess;
+    };
+    uint32_t object = 0, scale_bits = 0;
+    float scale = 0.0f;
+    if (readable(0x83134130u, 4)) {
+      object = rex::memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(0x83134130u));
+      if (readable(object, 64)) {
+        scale_bits = rex::memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(object + 60));
+        std::memcpy(&scale, &scale_bits, sizeof(scale));
+      } else object = 0;
+    }
+    if (previous) {
+      REXLOG_WARN("CORRECT: game timing host_s={:.3f} guest_s={:.3f} tick_hz={} vblanks={} swaps={} engine_clock={:08X} timescale={} scale_bits={:08X} host_cap={}",
+                  host_s, guest_s, frequency, vb - timing_vblanks_, swaps - timing_swaps_,
+                  object, scale, scale_bits, REXCVAR_GET(mercs2_min_frame_vblanks));
+    }
+    timing_previous_ = now; timing_ticks_ = ticks; timing_vblanks_ = vb; timing_swaps_ = swaps;
+  }
+
   void ReportSlowFrame() {
     const auto now = Clock::now();
+    ReportGameTiming(now);
     const uint64_t game_wait_ns = wait_ns_ - frame_start_wait_ns_;
     frame_start_wait_ns_ = wait_ns_;
     const uint64_t idle_ns = ring_idle_ns_ - frame_start_idle_ns_;
@@ -1627,6 +1671,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint64_t ring_idle_ns_ = 0, hold_ns_ = 0;
   uint64_t frame_start_idle_ns_ = 0, frame_start_hold_ns_ = 0, frame_start_vblank_ns_ = 0,
            frame_start_skips_ = 0;
+  bool game_timing_diagnostics_ = false;
+  Clock::time_point timing_previous_{};
+  uint64_t timing_ticks_ = 0, timing_vblanks_ = 0, timing_swaps_ = 0;
   bool swap_interrupt_pending_ = false;
 
   std::atomic<uint32_t> ring_base_{0};
